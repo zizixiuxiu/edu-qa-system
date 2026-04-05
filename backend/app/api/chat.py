@@ -13,6 +13,7 @@ from app.services.vl_service import vl_service
 from app.services.experts.expert_pool import expert_pool
 from app.services.experts.llm_service import llm_service
 from app.services.iteration.quality_checker import quality_checker
+from app.services.tier0 import tier0_ingest_service  # 新增
 from app.models.database import Session as ChatSession
 
 router = APIRouter(prefix="/chat", tags=["问答"])
@@ -138,74 +139,65 @@ async def _async_quality_check(
     local_answer: str,
     subject: str
 ):
-    """异步质量检查 - 只记录结果，不自动入库（带问题去重）"""
+    """
+    异步质量检查 + 自动入库到 Tier 0
+    """
     try:
-        # 调用云端质检
+        # 1. 调用云端质检
         quality_result = await quality_checker.check_answer(
             question, local_answer, subject
         )
         
         if not quality_result:
+            print(f"[Chat] ⚠️ 质检无结果 (会话{session_id})")
             return
         
-        # 检查是否已存在相同问题的记录（且已有质检结果）
-        from sqlalchemy import select, func
-        from app.models.database import Expert
+        # 2. 获取会话和专家信息
+        from app.models.database import Session as ChatSession, Expert
         
-        # 先获取当前会话的专家信息
         current_session = await session.get(ChatSession, session_id)
         if not current_session:
+            print(f"[Chat] ⚠️ 会话不存在 (ID: {session_id})")
             return
         
         expert = await session.get(Expert, current_session.expert_id)
         if not expert:
+            print(f"[Chat] ⚠️ 专家不存在 (ID: {current_session.expert_id})")
             return
         
-        # 查找相同专家、相同问题（前50字符相似）且已有质检结果的记录
-        stmt = select(ChatSession).where(
-            ChatSession.expert_id == current_session.expert_id,
-            func.lower(func.left(ChatSession.user_query, 50)) == func.lower(question[:50]),
-            ChatSession.cloud_corrected.isnot(None),  # 已有质检结果
-            ChatSession.id != session_id  # 排除当前会话
-        ).order_by(ChatSession.overall_score.desc()).limit(1)
-        
-        result = await session.execute(stmt)
-        existing_session = result.scalar_one_or_none()
-        
-        if existing_session:
-            # 已存在相同问题的记录，比较质量分
-            new_score = quality_result["overall_score"]
-            existing_score = existing_session.overall_score or 0
-            
-            if new_score <= existing_score:
-                # 新记录质量不如已有记录，标记当前会话为重复（不保存质检结果）
-                print(f"[Chat] 问题重复，跳过入库 (会话{session_id}): {question[:50]}... (新:{new_score:.2f} <= 已有:{existing_score:.2f})")
-                return
-            else:
-                # 新记录质量更高，清除旧记录的质检结果（保留更好的）
-                print(f"[Chat] 发现更高质量回答，替换旧记录 (会话{session_id}): {question[:50]}... (新:{new_score:.2f} > 旧:{existing_score:.2f})")
-                existing_session.cloud_corrected = None
-                existing_session.overall_score = None
-                existing_session.accuracy_score = None
-                existing_session.completeness_score = None
-                existing_session.educational_score = None
-        
-        # 更新当前会话的质检结果
+        # 3. 更新会话的质检结果
         current_session.cloud_corrected = quality_result["corrected_answer"]
         current_session.accuracy_score = quality_result["accuracy_score"]
         current_session.completeness_score = quality_result["completeness_score"]
         current_session.educational_score = quality_result["educational_score"]
+        current_session.additional_score = quality_result.get("additional_score")
         current_session.overall_score = quality_result["overall_score"]
-        # 注意：additional_score 和 knowledge_type 字段数据库中暂时不存在，需要迁移后才能使用
+        current_session.knowledge_type = quality_result.get("knowledge_type", "qa")
         
         await session.commit()
         
-        # 注意：不再自动入库，改为在训练任务页面手动批量创建
-        if quality_result["overall_score"] >= settings.QUALITY_THRESHOLD:
-            print(f"[Chat] 质检完成 (会话{session_id}): 类型={quality_result.get('knowledge_type', 'qa')}, 质量={quality_result['overall_score']:.2f}, 待手动入库")
-                    
+        print(f"[Chat] ✅ 质检完成 (会话{session_id}): 类型={current_session.knowledge_type}, 质量={quality_result['overall_score']:.2f}")
+        
+        # 4. 自动入库到 Tier 0
+        ingest_result = await tier0_ingest_service.auto_ingest(
+            session=session,
+            session_id=session_id,
+            question=question,
+            local_answer=local_answer,
+            cloud_corrected=quality_result["corrected_answer"],
+            quality_result=quality_result,
+            expert_id=expert.id
+        )
+        
+        if ingest_result["status"] == "success":
+            print(f"[Chat] ✅ 自动入库成功 (知识ID: {ingest_result['knowledge_id']})")
+        else:
+            print(f"[Chat] ⚠️ 未入库: {ingest_result['reason']}")
+        
     except Exception as e:
-        print(f"[Chat] 异步质检失败: {e}")
+        print(f"[Chat] ❌ 异步质检/入库失败: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 @router.post("/upload-image")
