@@ -22,13 +22,59 @@ class Expert(SQLModel, table=True):
     is_active: bool = Field(default=True)            # 是否启用
     
     # 统计字段
-    knowledge_count: int = Field(default=0)
+    knowledge_count: int = Field(default=0)          # Tier 1/2 知识数量
     sft_data_count: int = Field(default=0)
     total_qa_count: int = Field(default=0)
     avg_response_time: float = Field(default=0.0)
     accuracy_rate: float = Field(default=0.0)        # 准确率
     
+    # 新增：Tier 0 知识数量
+    tier0_count: int = Field(default=0)
+    
     created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class Tier0Knowledge(SQLModel, table=True):
+    """Tier 0 本地迭代知识库 - 高质量质检知识"""
+    __tablename__ = "tier0_knowledge"
+    
+    id: Optional[int] = Field(default=None, primary_key=True)
+    expert_id: int = Field(foreign_key="experts.id", index=True)
+    
+    # 检索内容（简化后的问题，用于embedding匹配）
+    content: str
+    embedding: List[float] = Field(sa_column=Column(Vector(384)))
+    
+    # 完整问答对
+    meta_data: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column("metadata", JSON))
+    # meta_data格式: {
+    #   "question": "原始问题",
+    #   "answer": "云端纠正后的答案",
+    #   "local_answer": "本地生成的答案",
+    #   "knowledge_type": "formula|concept|template|step|qa",
+    #   "source_session_id": 123,
+    #   "improvement_suggestions": "改进建议"
+    # }
+    
+    # 质量评分（5维度）
+    quality_score: float  # 加权总分 0-5
+    accuracy_score: Optional[float] = None
+    completeness_score: Optional[float] = None
+    educational_score: Optional[float] = None
+    additional_score: Optional[float] = None
+    
+    # 去重哈希（问题前100字符的MD5）
+    dedup_hash: Optional[str] = Field(default=None, index=True)
+    
+    # 统计
+    usage_count: int = Field(default=0)
+    
+    # 时间戳
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    
+    # 关系
+    expert: Optional[Expert] = Relationship()
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     
     # 关系
@@ -126,10 +172,10 @@ class Session(SQLModel, table=True):
     completeness_score: Optional[float] = None
     educational_score: Optional[float] = None
     overall_score: Optional[float] = None
-    # 注意：数据库表中没有 additional_score 和 knowledge_type 字段
-    # 如需使用，请先执行数据库迁移
-    # additional_score: Optional[float] = None
-    # knowledge_type: Optional[str] = None
+    
+    # 新增字段（与论文一致）
+    additional_score: Optional[float] = None  # 额外维度评分
+    knowledge_type: Optional[str] = None      # formula/concept/template/step/qa
     
     # 实验标记
     experiment_mode: str = Field(default="full_system")  # 记录当时实验配置
