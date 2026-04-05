@@ -130,12 +130,14 @@ class Tier0IngestService:
                 "action": "keep_old"
             }
         
+        from sqlalchemy import func
+        
         # 第二层：向量相似度精确去重
         vector_stmt = select(
             Tier0Knowledge,
-            (1 - Tier0Knowledge.embedding.cosine_distance(new_embedding.tolist())).label("similarity")
+            (1 - func.cosine_distance(Tier0Knowledge.embedding, new_embedding.tolist())).label("similarity")
         ).order_by(
-            Tier0Knowledge.embedding.cosine_distance(new_embedding.tolist())
+            Tier0Knowledge.embedding.op('<=>')(new_embedding.tolist())
         ).limit(1)
         
         vector_result = await session.execute(vector_stmt)

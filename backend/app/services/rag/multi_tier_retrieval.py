@@ -12,7 +12,7 @@ import pickle
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
-from pgvector.sqlalchemy import cosine_distance
+from sqlalchemy import func
 
 # 延迟导入embedding服务
 embedding_service = None
@@ -360,14 +360,15 @@ class MultiTierRetriever:
         if not expert:
             return []
         
-        # 使用 pgvector 进行相似度搜索
+        # 使用 PostgreSQL 向量操作符 <=> (余弦距离)
+        # 余弦相似度 = 1 - 余弦距离
         stmt = select(
             Tier0Knowledge,
-            (1 - cosine_distance(Tier0Knowledge.embedding, query_embedding.tolist())).label("similarity")
+            (1 - func.cosine_distance(Tier0Knowledge.embedding, query_embedding.tolist())).label("similarity")
         ).where(
             Tier0Knowledge.expert_id == expert.id
         ).order_by(
-            cosine_distance(Tier0Knowledge.embedding, query_embedding.tolist())
+            Tier0Knowledge.embedding.op('<=>')(query_embedding.tolist())
         ).limit(top_k)
         
         result = await session.execute(stmt)
