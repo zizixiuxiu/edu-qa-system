@@ -75,12 +75,6 @@ class Tier0Knowledge(SQLModel, table=True):
     
     # 关系
     expert: Optional[Expert] = Relationship()
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
-    
-    # 关系
-    knowledges: List["Knowledge"] = Relationship(back_populates="expert")
-    sft_datas: List["SFTData"] = Relationship(back_populates="expert")
-    sessions: List["Session"] = Relationship(back_populates="expert")
 
 
 class Knowledge(SQLModel, table=True):
