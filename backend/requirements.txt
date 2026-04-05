@@ -1,0 +1,41 @@
+# 核心框架
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.3
+pydantic-settings==2.1.0
+python-multipart==0.0.6
+
+# 数据库
+sqlalchemy==2.0.25
+psycopg2-binary==2.9.9
+pgvector==0.2.4
+alembic==1.13.1
+
+# 向量与AI
+numpy==1.26.3
+sentence-transformers==2.2.2
+openai==1.10.0
+httpx==0.26.0
+
+# 机器学习和微调 (兼容Python 3.12)
+torch==2.2.0
+transformers==4.37.0
+peft==0.8.2
+datasets==2.16.1
+accelerate==0.26.1
+
+# 工具库
+python-dotenv==1.0.0
+aiofiles==23.2.1
+pillow==10.2.0
+pandas==2.2.0
+matplotlib==3.8.2
+seaborn==0.13.1
+
+# 实验与统计
+scipy==1.12.0
+scikit-learn==1.4.0
+
+# 异步任务（可选）
+celery==5.3.6
+redis==5.0.1

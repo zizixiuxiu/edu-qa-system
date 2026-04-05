@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Markdown Test</title>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <style>
+    body { font-family: Arial; padding: 20px; }
+    .test { border: 1px solid #ccc; padding: 10px; margin: 10px 0; }
+    h3 { color: #333; }
+    strong { color: #d63384; }
+  </style>
+</head>
+<body>
+  <h2>Markdown 渲染测试</h2>
+  <div id="input" class="test"></div>
+  <div id="output" class="test"></div>
+  
+  <script>
+    const text = `### 测试标题
+
+这是**粗体**文字。
+
+- 列表1
+- 列表2
+
+> 引用内容`;
+    
+    document.getElementById('input').innerHTML = '<strong>原始内容:</strong><pre>' + text + '</pre>';
+    document.getElementById('output').innerHTML = '<strong>渲染结果:</strong><div>' + marked.parse(text) + '</div>';
+  </script>
+</body>
+</html>
