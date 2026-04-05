@@ -5,10 +5,14 @@
 import os
 import json
 import numpy as np
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 from dataclasses import dataclass
 from pathlib import Path
 import pickle
+
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlmodel import select
+from pgvector.sqlalchemy import cosine_distance
 
 # 延迟导入embedding服务
 embedding_service = None
@@ -31,7 +35,7 @@ class RetrievalResult:
     dataset: str
     type: str  # choice / open
     score: float
-    tier: int  # 1: 学科库, 2: 通用库
+    tier: int  # 0: Tier 0本地高质量库, 1: 学科库, 2: 通用库
     metadata: Dict
 
 
@@ -225,79 +229,149 @@ class MultiTierRetriever:
             json.dump(meta, f)
         print(f"  缓存已保存到: {self.cache_dir}")
     
-    def retrieve(
+    async def retrieve(
         self,
+        session: AsyncSession,  # 新增
         query: str,
         subject: Optional[str] = None,
         top_k: int = 5,
-        tier_weights: Tuple[float, float] = (1.0, 0.7),
+        tier_weights: Tuple[float, float, float] = (0.5, 0.3, 0.2),  # Tier 0/1/2
         score_threshold: float = 0.5
     ) -> List[RetrievalResult]:
-        """多级检索"""
-        # 编码查询
-        es = get_embedding_service()
-        query_embedding = es.encode(query)
+        """三级检索 - Tier 0 > Tier 1 > Tier 2"""
+        from app.utils.embedding import embedding_service
+        query_embedding = embedding_service.encode(query)
         
         all_results = []
         
-        # T1: 学科库检索
+        # T0: Tier 0 本地高质量知识库（新增）
+        if subject:
+            t0_results = await self._search_tier0(
+                session, query_embedding, subject, top_k=top_k
+            )
+            for knowledge, score in t0_results:
+                weighted_score = score * tier_weights[0]
+                all_results.append((knowledge, weighted_score, 0))
+        
+        # T1: 学科库检索（现有代码保留）
         if subject and subject in self.subject_stores:
             store = self.subject_stores[subject]
             search_results = store.search(query_embedding, top_k=top_k * 2)
             
             for idx, score in search_results:
                 doc = store.docs[idx]
-                weighted_score = score * tier_weights[0]
+                weighted_score = score * tier_weights[1]
                 all_results.append((doc, weighted_score, 1))
         
-        # T2: 通用库检索（如果需要）
+        # T2: 通用库检索（现有代码保留）
         need_t2 = not all_results or all_results[0][1] < score_threshold
-        
         if need_t2 and len(self.general_store.docs) > 0:
             search_results = self.general_store.search(query_embedding, top_k=top_k)
             
             for idx, score in search_results:
                 doc = self.general_store.docs[idx]
-                weighted_score = score * tier_weights[1]
+                weighted_score = score * tier_weights[2]
                 
-                # 去重
-                if not any(r[0]['id'] == doc['id'] for r in all_results):
+                # 去重检查
+                doc_id = doc.get('id', '')
+                if not any(
+                    (isinstance(r[0], dict) and r[0].get('id') == doc_id) or
+                    (hasattr(r[0], 'id') and r[0].id == doc_id)
+                    for r in all_results
+                ):
                     all_results.append((doc, weighted_score, 2))
         
         # 排序并取 top_k
         all_results.sort(key=lambda x: x[1], reverse=True)
         
+        # 转换为 RetrievalResult
         results = []
-        for doc, score, tier in all_results[:top_k]:
-            results.append(RetrievalResult(
-                id=doc['id'],
-                question=doc['question'],
-                answer=doc['answer'],
-                subject=doc['subject'],
-                dataset=doc['dataset'],
-                type=doc['type'],
-                score=score,
-                tier=tier,
-                metadata=doc['metadata']
-            ))
+        for item, score, tier in all_results[:top_k]:
+            if tier == 0:
+                # Tier 0: Tier0Knowledge 对象
+                results.append(RetrievalResult(
+                    id=f"t0_{item.id}",
+                    question=item.meta_data.get('question', item.content),
+                    answer=item.meta_data.get('answer', ''),
+                    subject=subject or '通用',
+                    dataset='tier0_local',
+                    type=item.meta_data.get('knowledge_type', 'qa'),
+                    score=score,
+                    tier=tier,
+                    metadata={
+                        'quality_score': item.quality_score,
+                        'accuracy_score': item.accuracy_score,
+                        'source': 'tier0_local'
+                    }
+                ))
+            else:
+                # Tier 1/2: dict 格式
+                results.append(RetrievalResult(
+                    id=item['id'],
+                    question=item['question'],
+                    answer=item['answer'],
+                    subject=item['subject'],
+                    dataset=item['dataset'],
+                    type=item['type'],
+                    score=score,
+                    tier=tier,
+                    metadata=item.get('metadata', {})
+                ))
         
         return results
     
     def format_context(self, results: List[RetrievalResult]) -> str:
-        """格式化检索结果 - 只包含问题，不含答案（保证基准测试有效性）"""
+        """格式化检索结果"""
         if not results:
             return ""
         
         contexts = []
         for i, r in enumerate(results, 1):
-            # 只包含问题，绝不包含答案！
-            ctx = f"[{i}] {r.question}"
+            tier_label = {0: "[高质量]", 1: "[学科库]", 2: "[通用库]"}.get(r.tier, "")
+            
+            ctx = f"{tier_label}[{i}] {r.question}"
+            
+            if r.tier == 0 and r.metadata.get('quality_score'):
+                ctx += f" (质量分: {r.metadata['quality_score']:.1f})"
+            
             if r.type == 'choice' and r.metadata.get('choices'):
                 choices = r.metadata['choices'][:4]
                 ctx += f"\n选项: {', '.join(str(c) for c in choices)}"
+            
             contexts.append(ctx)
         
         return "\n\n".join(contexts)
+    
+    async def _search_tier0(
+        self,
+        session: AsyncSession,
+        query_embedding: np.ndarray,
+        subject: str,
+        top_k: int = 3
+    ) -> List[Tuple[Any, float]]:
+        """搜索 Tier 0 本地高质量知识库"""
+        from app.models.database import Tier0Knowledge, Expert
+        
+        # 获取专家ID
+        expert_stmt = select(Expert).where(Expert.subject == subject)
+        expert_result = await session.execute(expert_stmt)
+        expert = expert_result.scalar_one_or_none()
+        
+        if not expert:
+            return []
+        
+        # 使用 pgvector 进行相似度搜索
+        stmt = select(
+            Tier0Knowledge,
+            (1 - cosine_distance(Tier0Knowledge.embedding, query_embedding.tolist())).label("similarity")
+        ).where(
+            Tier0Knowledge.expert_id == expert.id
+        ).order_by(
+            cosine_distance(Tier0Knowledge.embedding, query_embedding.tolist())
+        ).limit(top_k)
+        
+        result = await session.execute(stmt)
+        return [(row[0], float(row[1])) for row in result.all()]
 
 
 # 全局单例
