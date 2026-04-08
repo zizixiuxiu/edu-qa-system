@@ -126,7 +126,7 @@
         <button 
           class="send-btn"
           @click="sendMessage"
-          :disabled="isLoading || !inputMessage.trim()"
+          :disabled="isLoading || (!inputMessage.trim() && !currentImage)"
         >
           <el-icon size="24"><Promotion /></el-icon>
         </button>
@@ -279,16 +279,20 @@ async function handleImageUpload(file: File) {
 }
 
 async function sendMessage() {
-  if (!inputMessage.value.trim() || isLoading.value) return
+  // 允许纯文字、纯图片、或图文混合
+  const hasText = inputMessage.value.trim()
+  const hasImage = currentImage.value
+  
+  if ((!hasText && !hasImage) || isLoading.value) return
 
   const userMsg: Message = {
     role: 'user',
-    content: inputMessage.value,
+    content: inputMessage.value || '[图片]',
     image: currentImage.value || undefined
   }
   messages.value.push(userMsg)
 
-  const question = inputMessage.value
+  const question = inputMessage.value || '请解答图片中的题目'
   const image = currentImage.value
   
   inputMessage.value = ''
@@ -357,7 +361,8 @@ function scrollToBottom() {
 }
 
 .chat-container {
-  height: 100%;
+  min-height: calc(100vh - 48px - 48px);
+  height: auto;
   display: flex;
   flex-direction: column;
   border: var(--border);
@@ -394,6 +399,8 @@ function scrollToBottom() {
 
 .chat-messages {
   flex: 1;
+  min-height: 400px;
+  max-height: calc(100vh - 200px);
   overflow-y: auto;
   padding: 20px;
   background: #fafafa;
@@ -808,11 +815,11 @@ function scrollToBottom() {
     color: var(--memphis-pink);
   }
   
-  /* 分隔线样式 */
+  /* 分隔线样式 - 灰色系 */
   :deep(hr) {
     border: none;
-    height: 2px;
-    background: linear-gradient(to right, var(--memphis-black), var(--memphis-yellow), var(--memphis-black));
+    height: 1px;
+    background: linear-gradient(to right, transparent, #c0c0c0, #a0a0a0, #c0c0c0, transparent);
     margin: 1.5em 0;
     position: relative;
   }
@@ -825,8 +832,8 @@ function scrollToBottom() {
     transform: translate(-50%, -50%);
     background: var(--memphis-white);
     padding: 0 8px;
-    color: var(--memphis-pink);
-    font-size: 12px;
+    color: #909090;
+    font-size: 10px;
   }
   
   /* 强调样式 */

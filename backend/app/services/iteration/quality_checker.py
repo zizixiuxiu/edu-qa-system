@@ -249,19 +249,32 @@ class QualityChecker:
             # 尝试提取JSON
             json_match = re.search(r'\{[\s\S]*\}', cleaned)
             if json_match:
-                try:
-                    data = json.loads(json_match.group())
-                except json.JSONDecodeError:
-                    # 备用清理
-                    json_str = json_match.group()
-                    json_str = ''.join(char for char in json_str if ord(char) >= 32 or char in '\n\r\t')
-                    data = json.loads(json_str)
+                json_str = json_match.group()
                 
-                # 获取各维度分数
-                accuracy = float(data.get("accuracy_score", 3))
-                completeness = float(data.get("completeness_score", 3))
-                educational = float(data.get("educational_score", 3))
-                additional = float(data.get("additional_score", 3))
+                try:
+                    data = json.loads(json_str)
+                except json.JSONDecodeError as e:
+                    # 处理 LaTeX 公式中的转义字符
+                    # 先将 \ 替换为占位符，解析后再还原
+                    placeholder = "<<<BACKSLASH>>>"
+                    json_str_processed = json_str.replace("\\\\", placeholder)
+                    
+                    try:
+                        data = json.loads(json_str_processed)
+                        # 还原 \
+                        for key in data:
+                            if isinstance(data[key], str):
+                                data[key] = data[key].replace(placeholder, "\\")
+                    except json.JSONDecodeError:
+                        # 备用清理：移除控制字符
+                        json_str = ''.join(char for char in json_str if ord(char) >= 32 or char in '\n\r\t')
+                        data = json.loads(json_str)
+                
+                # 获取各维度分数（处理 None 值）
+                accuracy = float(data.get("accuracy_score") or 3)
+                completeness = float(data.get("completeness_score") or 3)
+                educational = float(data.get("educational_score") or 3)
+                additional = float(data.get("additional_score") or 3)
                 
                 # 根据类型计算加权综合分
                 knowledge_type = data.get("knowledge_type", default_type).lower()

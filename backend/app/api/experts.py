@@ -45,7 +45,9 @@ async def list_subjects(
 ) -> ResponseBase:
     """获取所有学科列表（包括未创建专家的）"""
     subjects = await expert_pool.list_all_subjects(session)
-    return ResponseBase(data=subjects)
+    # 转换为前端期望的格式 {value, label}
+    formatted = [{"value": s["subject"], "label": s["subject"]} for s in subjects]
+    return ResponseBase(data=formatted)
 
 
 @router.get("/{expert_id}", response_model=ResponseBase)

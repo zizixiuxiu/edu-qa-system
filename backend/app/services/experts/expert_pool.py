@@ -1,11 +1,17 @@
-"""专家池管理器 - 按学科划分，支持动态扩展"""
+"""专家池管理器 - 按学科划分，支持动态扩展，集成L1/L2缓存"""
 from sqlmodel import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional, List, Dict
 import os
+import time
 
 from app.models.database import Expert
 from app.core.config import settings
+from app.services.cache_service import cache_manager
+
+
+# 缓存TTL配置 (秒)
+EXPERT_CACHE_TTL = getattr(settings, 'REDIS_TTL_EXPERT', 7200)  # 专家信息缓存2小时
 
 
 class ExpertPoolManager:
@@ -22,7 +28,9 @@ class ExpertPoolManager:
     DEFAULT_SUBJECTS = ["数学", "物理", "化学", "语文", "英语", "生物", "历史", "地理", "政治", "通用"]
     
     def __init__(self):
-        self._cache: Dict[str, Expert] = {}  # 按学科缓存
+        self._local_cache: Dict[str, Expert] = {}  # L1内存缓存补充
+        self._cache_hits = 0
+        self._cache_misses = 0
     
     async def get_or_create_expert(
         self,
@@ -30,7 +38,7 @@ class ExpertPoolManager:
         subject: str
     ) -> Expert:
         """
-        获取或创建学科专家
+        获取或创建学科专家 - L1→L2→DB四级缓存架构
         
         Args:
             subject: 学科名称，如"数学"
@@ -40,74 +48,125 @@ class ExpertPoolManager:
         """
         # 标准化学科名称
         subject = subject.strip()
+        cache_key = ("expert", subject)
         
-        # 先查缓存
-        if subject in self._cache:
-            return self._cache[subject]
+        # L1: 本地内存缓存
+        if subject in self._local_cache:
+            self._cache_hits += 1
+            return self._local_cache[subject]
         
-        # 查询数据库
+        # L2: Redis分布式缓存
+        if settings.ENABLE_CACHE:
+            cached = await cache_manager.get("expert", subject)
+            if cached:
+                self._cache_hits += 1
+                # 重建Expert对象
+                expert = Expert(**cached)
+                self._local_cache[subject] = expert
+                return expert
+        
+        self._cache_misses += 1
+        
+        # L3: 数据库查询
         statement = select(Expert).where(Expert.subject == subject)
         result = await session.execute(statement)
         expert = result.scalar_one_or_none()
         
-        if expert:
-            self._cache[subject] = expert
-            return expert
+        if not expert:
+            # 冷启动: 创建新专家
+            expert_name = f"{subject}专家"
+            expert = Expert(
+                subject=subject,
+                name=expert_name,
+                model_type="base",
+                lora_path=None,
+                is_active=True
+            )
+            session.add(expert)
+            await session.commit()
+            await session.refresh(expert)
+            
+            # 创建专家权重目录
+            expert_weight_dir = f"experts/{expert.id}"
+            os.makedirs(expert_weight_dir, exist_ok=True)
+            
+            print(f"[ExpertPool] 🆕 冷启动创建专家: {expert_name} (ID: {expert.id})")
         
-        # 创建新专家
-        expert_name = f"{subject}专家"
-        expert = Expert(
-            subject=subject,
-            name=expert_name,
-            model_type="base",
-            lora_path=None,
-            is_active=True
-        )
-        session.add(expert)
-        await session.commit()
-        await session.refresh(expert)
-        
-        # 创建专家权重目录
-        expert_weight_dir = f"experts/{expert.id}"
-        os.makedirs(expert_weight_dir, exist_ok=True)
-        
-        self._cache[subject] = expert
-        print(f"[ExpertPool] 创建新学科专家: {expert_name} (ID: {expert.id})")
+        # 回填缓存
+        await self._cache_expert(expert)
         return expert
+    
+    async def _cache_expert(self, expert: Expert):
+        """将专家信息写入缓存"""
+        # L1
+        self._local_cache[expert.subject] = expert
+        
+        # L2: 序列化为dict存储
+        if settings.ENABLE_CACHE:
+            expert_dict = {
+                "id": expert.id,
+                "subject": expert.subject,
+                "name": expert.name,
+                "model_type": expert.model_type,
+                "lora_path": expert.lora_path,
+                "is_active": expert.is_active,
+                "knowledge_count": expert.knowledge_count,
+                "accuracy_rate": expert.accuracy_rate,
+                "avg_response_time": expert.avg_response_time,
+                "total_qa_count": expert.total_qa_count
+            }
+            await cache_manager.set(
+                "expert", 
+                expert_dict, 
+                expert.subject,
+                ttl=EXPERT_CACHE_TTL
+            )
     
     async def get_expert_by_subject(
         self,
         session: AsyncSession,
         subject: str
     ) -> Optional[Expert]:
-        """通过学科名称获取专家"""
-        # 先查缓存
-        if subject in self._cache:
-            return self._cache[subject]
+        """通过学科名称获取专家 - 带缓存"""
+        # 复用get_or_create_expert逻辑，但不创建
+        subject = subject.strip()
         
+        # L1
+        if subject in self._local_cache:
+            return self._local_cache[subject]
+        
+        # L2
+        if settings.ENABLE_CACHE:
+            cached = await cache_manager.get("expert", subject)
+            if cached:
+                expert = Expert(**cached)
+                self._local_cache[subject] = expert
+                return expert
+        
+        # DB
         statement = select(Expert).where(Expert.subject == subject)
         result = await session.execute(statement)
         expert = result.scalar_one_or_none()
         
         if expert:
-            self._cache[subject] = expert
+            await self._cache_expert(expert)
         
         return expert
     
     async def get_expert(self, session: AsyncSession, expert_id: int) -> Optional[Expert]:
-        """通过ID获取专家"""
-        # 在缓存中查找
-        for expert in self._cache.values():
+        """通过ID获取专家 - 带缓存"""
+        # L1
+        for expert in self._local_cache.values():
             if expert.id == expert_id:
                 return expert
         
-        # 查询数据库
+        # DB (ID查询不缓存，直接查)
         statement = select(Expert).where(Expert.id == expert_id)
         result = await session.execute(statement)
         expert = result.scalar_one_or_none()
         
         if expert:
-            self._cache[expert.subject] = expert
+            await self._cache_expert(expert)
         
         return expert
     
@@ -191,7 +250,7 @@ class ExpertPoolManager:
         await session.commit()
         
         # 更新缓存
-        self._cache[expert.subject] = expert
+        await self._cache_expert(expert)
     
     async def toggle_expert_status(
         self,
@@ -204,21 +263,33 @@ class ExpertPoolManager:
         if expert:
             expert.is_active = is_active
             await session.commit()
-            self._cache[expert.subject] = expert
+            await self._cache_expert(expert)
             return True
         return False
     
     async def delete_expert(self, session: AsyncSession, expert_id: int) -> bool:
-        """删除专家"""
+        """删除专家并清除缓存"""
         expert = await self.get_expert(session, expert_id)
         if expert:
+            # 清除缓存
+            if expert.subject in self._local_cache:
+                del self._local_cache[expert.subject]
+            await cache_manager.delete("expert", expert.subject)
+            
             await session.delete(expert)
             await session.commit()
-            # 从缓存中移除
-            if expert.subject in self._cache:
-                del self._cache[expert.subject]
             return True
         return False
+    
+    def get_cache_stats(self) -> Dict:
+        """获取缓存统计"""
+        total = self._cache_hits + self._cache_misses
+        return {
+            "local_cache_size": len(self._local_cache),
+            "cache_hits": self._cache_hits,
+            "cache_misses": self._cache_misses,
+            "hit_rate": f"{self._cache_hits/total:.2%}" if total > 0 else "N/A"
+        }
     
     def get_expert_prompt(self, expert: Expert) -> str:
         """获取专家的角色Prompt - 使用 Markdown 格式"""

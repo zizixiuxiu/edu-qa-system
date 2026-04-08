@@ -1,13 +1,17 @@
 """FastAPI主应用入口"""
-from fastapi import FastAPI
+import asyncio
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 
 from app.core.config import settings
 from app.core.database import init_db, AsyncSessionLocal
-from app.api import chat, experts, experiments, benchmark, training, knowledge
+from app.api import chat, experts, experiments, benchmark, training, knowledge, tier0, cache as cache_api
 from app.services.experts.expert_pool import expert_pool
 from app.services.training_executor import training_executor
+from app.services.cache_service import cache_manager
+from app.utils.embedding import preload_embedding_model
 
 
 @asynccontextmanager
@@ -21,6 +25,12 @@ async def lifespan(app: FastAPI):
     # 自动创建默认学科专家
     async with AsyncSessionLocal() as session:
         await expert_pool.ensure_default_experts(session)
+    
+    # 初始化缓存服务
+    await cache_manager.initialize()
+    
+    # 预加载embedding模型（在后台线程中执行，避免阻塞）
+    await asyncio.to_thread(preload_embedding_model)
     
     # 启动训练任务执行器
     await training_executor.start()
@@ -67,6 +77,18 @@ async def add_cors_headers(request, call_next):
     response.headers["Access-Control-Allow-Credentials"] = "true"
     return response
 
+# 全局异常处理（确保CORS头）
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={"detail": str(exc)},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Credentials": "true"
+        }
+    )
+
 # 注册路由
 app.include_router(chat.router, prefix=settings.API_V1_STR)
 app.include_router(experts.router, prefix=settings.API_V1_STR)
@@ -74,6 +96,8 @@ app.include_router(knowledge.router, prefix=settings.API_V1_STR)
 app.include_router(experiments.router, prefix=settings.API_V1_STR)
 app.include_router(benchmark.router, prefix=settings.API_V1_STR)
 app.include_router(training.router, prefix=settings.API_V1_STR)
+app.include_router(tier0.router, prefix=settings.API_V1_STR)
+app.include_router(cache_api.router, prefix=settings.API_V1_STR)
 
 
 @app.get("/")

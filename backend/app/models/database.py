@@ -18,6 +18,7 @@ class Expert(SQLModel, table=True):
     # 模型配置
     model_type: str = Field(default="base")          # 模型类型: base/学科名
     lora_path: Optional[str] = None                  # LoRA路径
+    prompt_template: Optional[str] = None            # Prompt模板
     
     is_active: bool = Field(default=True)            # 是否启用
     
@@ -32,6 +33,13 @@ class Expert(SQLModel, table=True):
     tier0_count: int = Field(default=0)
     
     created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    
+    # 关系
+    knowledges: List["Knowledge"] = Relationship(back_populates="expert")
+    sft_datas: List["SFTData"] = Relationship(back_populates="expert")
+    sessions: List["Session"] = Relationship(back_populates="expert")
+    tier0_knowledges: List["Tier0Knowledge"] = Relationship(back_populates="expert")
 
 
 class Tier0Knowledge(SQLModel, table=True):
@@ -83,30 +91,29 @@ class Knowledge(SQLModel, table=True):
     
     id: Optional[int] = Field(default=None, primary_key=True)
     expert_id: int = Field(foreign_key="experts.id", index=True)
-    content: str                                     # 检索内容（简化的问题/关键词，用于embedding匹配）
+    question: str                                     # 问题
+    answer: str                                       # 答案
+    tier: int = Field(default=2)                      # 知识等级: 1-高质量, 2-普通
+    
     embedding: List[float] = Field(sa_column=Column(Vector(384)))  # BGE-Small向量 (384维)
+    content: Optional[str] = None                     # 检索内容（可为空）
     
-    # 答案和元数据（核心内容）
+    # 元数据
     meta_data: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column("metadata", JSON))
-    # meta_data格式: {
-    #   "question": "原始问题",
-    #   "answer": "答案内容",
-    #   "knowledge_type": "qa|concept|formula|template|step",
-    #   "subject_specific": {...}  # 学科特有字段
-    # }
     
-    # 知识分类（用于RAG策略优化）
-    knowledge_type: str = Field(default="qa", index=True)  
-    # "qa": 问答对（标准范式）
-    # "concept": 核心概念/定义
-    # "formula": 公式/定律
-    # "template": 解题模板/套路
-    # "step": 步骤/流程
+    # 知识分类
+    knowledge_type: Optional[str] = Field(default="qa", index=True)
     
     # 来源与质量
-    source_type: str = Field(default="generated")    # "generated" | "wrong_answer_extracted" | "manual"
+    source_type: Optional[str] = Field(default="generated")
     quality_score: float = Field(default=0.0)
     usage_count: int = Field(default=0)
+    
+    # 审核相关字段
+    source: Optional[str] = None
+    review_status: str = Field(default="approved")
+    reviewed_by: Optional[int] = None
+    reviewed_at: Optional[datetime] = None
     
     created_at: datetime = Field(default_factory=datetime.utcnow)
     
@@ -271,5 +278,10 @@ class BenchmarkResult(SQLModel, table=True):
     # 迭代队列标记
     is_in_iteration_queue: bool = Field(default=False)  # 是否已加入迭代队列
     is_processed: bool = Field(default=False)           # 是否已处理生成知识点
+    
+    # 🔥 实验配置标识 - 区分不同实验模式的结果（Baseline/ExpertOnly/RAGOnly/FullSystem）
+    experiment_config: Optional[str] = Field(default=None, index=True)
+    # 🔥 实验ID - 区分同配置的多轮实验（如 FullSystem 第1/2/3轮）
+    experiment_id: Optional[str] = Field(default=None, index=True)
     
     created_at: datetime = Field(default_factory=datetime.utcnow)

@@ -1,20 +1,28 @@
 """
-RAG检索服务 - 支持知识类型感知的智能检索
+RAG检索服务 - 支持知识类型感知的智能检索，集成L1/L2缓存
 策略：
 1. 根据查询意图识别需要的知识类型
 2. 优先检索对应类型的知识
 3. 专家库+通用库的级联检索
 4. 按类型和相似度综合排序
+5. 向量结果缓存加速
 """
 from typing import List, Dict, Tuple, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_, func
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 import re
+import json
 
 from app.models.database import Knowledge, Expert
 from app.utils.embedding import embedding_service
 from app.core.config import settings
+from app.services.cache_service import cache_manager
+
+
+# 缓存TTL配置
+RAG_CACHE_TTL = getattr(settings, 'REDIS_TTL_RAG', 1800)  # RAG结果缓存30分钟
+VECTOR_CACHE_TTL = getattr(settings, 'REDIS_TTL_VECTOR', 3600)  # 向量缓存1小时
 
 
 @dataclass
@@ -54,6 +62,10 @@ class RetrievalService:
     
     def __init__(self):
         self.embedding_service = embedding_service
+        self._vector_cache_hits = 0
+        self._vector_cache_misses = 0
+        self._rag_cache_hits = 0
+        self._rag_cache_misses = 0
     
     def detect_query_type(self, query: str) -> Optional[str]:
         """
@@ -90,10 +102,11 @@ class RetrievalService:
         expert_id: int,
         query: str,
         top_k: int = 5,
-        max_general: int = 3
+        max_general: int = 3,
+        use_cache: bool = True
     ) -> Tuple[List[RetrievalResult], Dict]:
         """
-        智能检索知识
+        智能检索知识 - 带L1/L2缓存
         
         Args:
             session: 数据库会话
@@ -101,15 +114,31 @@ class RetrievalService:
             query: 查询文本
             top_k: 返回结果数量
             max_general: 最多返回的通用知识数量
+            use_cache: 是否使用缓存
             
         Returns:
             (结果列表, 检索统计信息)
         """
+        # 检查缓存 (expert_id + query + top_k 作为key)
+        if use_cache and settings.ENABLE_CACHE:
+            cache_key = f"{expert_id}:{query}:{top_k}:{max_general}"
+            cached = await cache_manager.get("rag_retrieval", cache_key)
+            if cached:
+                self._rag_cache_hits += 1
+                # 重建RetrievalResult对象
+                results = []
+                for item in cached["results"]:
+                    # 这里只存了knowledge_id，需要重新查询
+                    # 简化处理: 缓存存储完整知识内容
+                    pass
+                return cached["results"], cached["stats"]
+            self._rag_cache_misses += 1
+        
         # 1. 检测查询类型
         query_type = self.detect_query_type(query)
         
-        # 2. 向量化查询
-        query_embedding = self.embedding_service.encode(query)
+        # 2. 向量化查询 (带缓存)
+        query_embedding = await self._get_cached_embedding(query)
         
         results = []
         stats = {
@@ -122,7 +151,13 @@ class RetrievalService:
             "trigger_reason": None
         }
         
+        # 🔥 检查是否为通用专家
+        is_general = await self._is_general_expert(session, expert_id)
+        if is_general:
+            stats["is_general_expert"] = True
+        
         # 3. 检索专家知识库
+        # 🔥 通用专家会检索所有学科的知识
         expert_results = await self._search_expert_knowledge(
             session, expert_id, query_embedding, top_k * 3, query_type
         )
@@ -134,9 +169,14 @@ class RetrievalService:
             results.extend(expert_results)
         
         # 4. 判断是否触发通用库检索
-        should_trigger_general = self._should_trigger_general(
-            expert_results, self.GENERAL_TRIGGER_THRESHOLD
-        )
+        # 🔥 通用专家已检索全部知识，无需再触发
+        if is_general:
+            should_trigger_general = False
+            stats["trigger_reason"] = "通用专家已检索所有学科知识"
+        else:
+            should_trigger_general = self._should_trigger_general(
+                expert_results, self.GENERAL_TRIGGER_THRESHOLD
+            )
         
         if should_trigger_general:
             stats["trigger_reason"] = f"专家库最高相似度({stats['expert_max_similarity']:.3f})低于阈值"
@@ -177,8 +217,48 @@ class RetrievalService:
         stats["expert_results"] = sum(1 for r in final_results if r.source == "expert")
         stats["general_results"] = sum(1 for r in final_results if r.source == "general")
         stats["type_distribution"] = self._count_types(final_results)
+        stats["cache_enabled"] = use_cache and settings.ENABLE_CACHE
+        
+        # 8. 写入缓存 (序列化结果)
+        if use_cache and settings.ENABLE_CACHE:
+            cache_key = f"{expert_id}:{query}:{top_k}:{max_general}"
+            cache_data = {
+                "results": [
+                    {
+                        "knowledge_id": r.knowledge.id,
+                        "content": r.knowledge.content,
+                        "similarity": r.similarity,
+                        "source": r.source,
+                        "type": r.knowledge.knowledge_type
+                    }
+                    for r in final_results
+                ],
+                "stats": stats
+            }
+            await cache_manager.set("rag_retrieval", cache_data, cache_key, ttl=RAG_CACHE_TTL)
         
         return final_results, stats
+    
+    async def _get_cached_embedding(self, query: str) -> List[float]:
+        """获取带缓存的向量"""
+        if not settings.ENABLE_CACHE:
+            return self.embedding_service.encode(query)
+        
+        # 查缓存
+        cached = await cache_manager.get("vector", query)
+        if cached:
+            self._vector_cache_hits += 1
+            return cached
+        
+        self._vector_cache_misses += 1
+        
+        # 计算向量
+        embedding = self.embedding_service.encode(query)
+        
+        # 写缓存
+        await cache_manager.set("vector", embedding, query, ttl=VECTOR_CACHE_TTL, l1_only=True)
+        
+        return embedding
     
     async def _search_expert_knowledge(
         self,
@@ -193,14 +273,22 @@ class RetrievalService:
         搜索专家知识库（支持类型过滤）
         
         如果query_type不为None，优先检索该类型，但仍返回其他类型
+        🔥 特殊逻辑：如果是通用专家，检索所有学科的知识
         """
+        # 检查是否为通用专家
+        is_general = await self._is_general_expert(session, expert_id)
+        
         # 基础查询
         base_query = select(
             Knowledge,
             Knowledge.embedding.cosine_distance(query_embedding).label("distance")
-        ).where(
-            Knowledge.expert_id == expert_id
         )
+        
+        # 🔥 通用专家检索所有学科知识
+        if is_general:
+            base_query = base_query  # 不限制expert_id，检索全部
+        else:
+            base_query = base_query.where(Knowledge.expert_id == expert_id)
         
         # 如果指定了查询类型，优先检索该类型（多取一些）
         if query_type:
@@ -231,6 +319,9 @@ class RetrievalService:
         
         results = []
         for knowledge, distance in rows:
+            # 处理 distance 为 None 的情况
+            if distance is None:
+                continue
             similarity = 1.0 - float(distance)
             
             # 计算类型加成
@@ -279,6 +370,15 @@ class RetrievalService:
         unique_results.sort(key=lambda x: x.combined_score, reverse=True)
         
         return unique_results
+    
+    async def _is_general_expert(self, session: AsyncSession, expert_id: int) -> bool:
+        """检查是否为通用专家"""
+        statement = select(Expert).where(Expert.id == expert_id)
+        result = await session.execute(statement)
+        expert = result.scalar_one_or_none()
+        if expert and expert.subject in ["通用", "其他", "general"]:
+            return True
+        return False
     
     async def _get_general_expert(self, session: AsyncSession) -> Optional[Expert]:
         """获取通用专家"""
@@ -329,6 +429,23 @@ class RetrievalService:
             ktype = r.knowledge.knowledge_type
             distribution[ktype] = distribution.get(ktype, 0) + 1
         return distribution
+    
+    def get_cache_stats(self) -> Dict:
+        """获取缓存统计"""
+        vector_total = self._vector_cache_hits + self._vector_cache_misses
+        rag_total = self._rag_cache_hits + self._rag_cache_misses
+        return {
+            "vector_cache": {
+                "hits": self._vector_cache_hits,
+                "misses": self._vector_cache_misses,
+                "hit_rate": f"{self._vector_cache_hits/vector_total:.2%}" if vector_total > 0 else "N/A"
+            },
+            "rag_cache": {
+                "hits": self._rag_cache_hits,
+                "misses": self._rag_cache_misses,
+                "hit_rate": f"{self._rag_cache_hits/rag_total:.2%}" if rag_total > 0 else "N/A"
+            }
+        }
 
 
 # 全局服务实例

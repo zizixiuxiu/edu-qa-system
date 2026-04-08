@@ -11,13 +11,14 @@
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, update
+from sqlalchemy import select, func, update, String
 from typing import List, Optional, Dict
 from pydantic import BaseModel
 import httpx
 import json
 import asyncio
 import os
+import re
 from datetime import datetime
 
 from app.core.database import get_session as get_async_session, AsyncSessionLocal
@@ -28,9 +29,106 @@ from app.services.iteration.quality_checker import quality_checker
 from app.services.iteration.data_generator import data_generator
 from app.services.iteration.knowledge_generator import knowledge_generator
 from app.services.benchmark.report_saver import report_saver
-from app.models.database import BenchmarkDataset, BenchmarkResult, Expert
+from app.models.database import BenchmarkDataset, BenchmarkResult, Expert, Knowledge
 
 router = APIRouter(prefix="/benchmark", tags=["benchmark"])
+
+
+# ============= 选择题模板生成 =============
+
+async def generate_choice_template(
+    question: str,
+    correct_answer: str,
+    model_answer: str,
+    subject: str
+) -> str:
+    """
+    生成选择题的标准解题模板范式
+    
+    包含：
+    1. 题目类型识别
+    2. 涉及知识点
+    3. 解题思路/步骤
+    4. 标准解答过程
+    5. 易错点提示
+    """
+    
+    system_prompt = f"""你是一位{subject}学科的专家教师，擅长将具体题目的解法提炼为标准解题模板。
+
+任务：将这道选择题的解答过程，转化为**可复用的解题模板范式**。
+
+模板必须包含以下结构：
+
+## 一、题目类型识别
+- 题型归类（如：三角函数求值、导数应用、立体几何证明等）
+- 核心考查点
+
+## 二、涉及知识点
+- 列出本题涉及的所有公式、定理、概念
+- 标注重点公式
+
+## 三、解题思路/通用步骤
+提供解决这类题的**标准思维路径**：
+1. 第一步：...
+2. 第二步：...
+3. ...
+
+## 四、本题详细解答
+基于上述思路，给出本题的具体解答：
+- 推导过程（详细数学步骤）
+- 最终答案
+
+## 五、易错点与技巧
+- 常见错误警示
+- 快速解题技巧
+- 同类题变式提示
+
+要求：
+- 使用 LaTeX 格式书写数学公式
+- 语言简洁专业，便于学生理解和记忆
+- 模板应能套用到同类题目上"""
+
+    user_prompt = f"""【题目】
+{question}
+
+【标准答案】
+{correct_answer}
+
+【学生/系统的错误答案】
+{model_answer}
+
+请按照上述模板结构，生成标准解题范式。"""
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{settings.CLOUD_BASE_URL}/chat/completions",
+                headers={"Authorization": f"Bearer {settings.CLOUD_API_KEY}"},
+                json={
+                    "model": settings.CLOUD_MODEL,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    "temperature": 0.3,
+                    "max_tokens": 2500
+                },
+                timeout=60.0
+            )
+            response.raise_for_status()
+            result = response.json()
+            return result["choices"][0]["message"]["content"]
+    except Exception as e:
+        print(f"[GenerateTemplate] 生成模板失败: {e}")
+        # 失败时返回基础模板
+        return f"""## 参考答案
+{correct_answer}
+
+## 解析
+{model_answer}
+
+## 提示
+本题涉及相关{subject}知识点，建议复习对应章节。"""
 
 
 # ============= 数据模型 =============
@@ -46,6 +144,15 @@ class StartTestRequest(BaseModel):
     mode: str = "all"  # all, wrong, random, by_subject
     subject: Optional[str] = None  # 按学科测试
     year: Optional[str] = None  # 按年份测试
+    
+    # 实验控制参数（简化版：use_rag 控制是否使用知识库检索）
+    experiment_id: Optional[str] = None  # 关联的实验ID
+    random_seed: Optional[int] = None  # 随机种子（控制数据集shuffle）
+    use_rag: bool = True  # 是否使用RAG知识检索（RAGOnly/FullSystem启用，Baseline/ExpertOnly禁用）
+    use_expert_routing: bool = True  # 是否使用专家路由（ExpertOnly/FullSystem启用，Baseline/RAGOnly禁用）
+    enable_iteration: bool = False  # 是否启用迭代/自动入库（默认禁用，仅FullSystem应显式启用）
+    max_questions: Optional[int] = None  # 最大题目数
+    use_experiment_dataset: bool = False  # 是否使用实验数据集（50题）
 
 
 class AddToIterationRequest(BaseModel):
@@ -82,7 +189,9 @@ current_test_task = {
     "start_time": None,
     "error": None,
     "stopped": False,  # 是否被手动停止
-    "task": None  # 保存后台任务引用，用于强制取消
+    "task": None,  # 保存后台任务引用，用于强制取消
+    "experiment_id": None,  # 关联的实验ID
+    "config": {}  # 实验配置
 }
 
 # GAOKAO-Bench 数据集本地路径
@@ -269,45 +378,158 @@ async def start_benchmark(
     if current_test_task["is_running"]:
         raise HTTPException(status_code=400, detail="已有测试正在进行")
     
+    # ==================== 实验模式识别与日志 ====================
+    print("\n" + "="*60)
+    print("[🧪 实验启动] 配置详情")
+    print("="*60)
+    
+    # 判断实验模式（简化：只用 use_rag 和 use_expert_routing 两个开关）
+    exp_mode_name = "未知模式"
+    if not request.use_expert_routing and not request.use_rag:
+        exp_mode_name = "📊 Baseline 基线（无路由无RAG）"
+    elif request.use_expert_routing and not request.use_rag:
+        exp_mode_name = "🔀 ExpertOnly 专家路由（有路由无RAG）"
+    elif not request.use_expert_routing and request.use_rag:
+        exp_mode_name = "📚 RAGOnly RAG增强（无路由有RAG）"
+    elif request.use_expert_routing and request.use_rag:
+        if request.enable_iteration:
+            exp_mode_name = "🔄 FullSystem 完整系统（含自进化）"
+        else:
+            exp_mode_name = "✅ FullSystem 完整系统（无自进化）"
+    else:
+        exp_mode_name = "⚙️ 自定义配置"
+    
+    print(f"[模式识别] {exp_mode_name}")
+    print(f"[实验ID] {request.experiment_id or 'N/A'}")
+    print(f"[题目配置] 随机种子={request.random_seed}, 数量={request.max_questions or '全部'}")
+    print("-"*60)
+    print("[开关状态]")
+    print(f"  ├─ 专家路由 (use_expert_routing): {'✅ 启用' if request.use_expert_routing else '❌ 禁用'}")
+    print(f"  ├─ RAG知识检索 (use_rag): {'✅ 启用' if request.use_rag else '❌ 禁用'}")
+    print(f"  └─ 自动入库/迭代 (enable_iteration): {'✅ 启用' if request.enable_iteration else '❌ 禁用'}")
+    print("-"*60)
+    
+    # 实验目的提示
+    if not request.use_expert_routing and not request.use_rag:
+        print("[实验目的] 测量基线准确率（纯模型能力，无增强）")
+    elif request.use_expert_routing and not request.use_rag:
+        print("[实验目的] 测量专家路由贡献度（vs Baseline）")
+    elif not request.use_expert_routing and request.use_rag:
+        print("[实验目的] 测量RAG独立贡献度（vs Baseline）")
+    elif request.use_expert_routing and request.use_rag and not request.enable_iteration:
+        print("[实验目的] 测量完整系统初始性能（无自进化）")
+    elif request.use_expert_routing and request.use_rag and request.enable_iteration:
+        print("[实验目的] 测量自进化效果（迭代后 vs 迭代前）")
+    
+    print("="*60 + "\n")
+    
     # 验证专家（如果指定了）
     expert = None
     if request.expert_id:
-        expert = await session.get(Expert, request.expert_id)
+        expert = await session.get(Expert, request.experiment_id)
         if not expert:
             raise HTTPException(status_code=404, detail="专家不存在")
     
-    # 构建查询
-    query = select(BenchmarkDataset)
+    # 构建查询 - 支持实验数据集
+    print(f"[DEBUG] use_experiment_dataset={request.use_experiment_dataset}")
+    if request.use_experiment_dataset:
+        # 从实验数据集读取
+        from sqlalchemy import text
+        result = await session.execute(text("SELECT id, question, correct_answer, subject, year, category, analysis FROM experiment_dataset ORDER BY RANDOM() LIMIT 50"))
+        rows = result.fetchall()
+        questions = []
+        for row in rows:
+            # 创建临时的BenchmarkDataset对象
+            q = BenchmarkDataset(
+                id=row[0],
+                question=row[1],
+                correct_answer=row[2],
+                subject=row[3],
+                year=row[4],
+                category=row[5],
+                analysis=row[6],
+                difficulty="medium",
+                question_type="objective"
+            )
+            questions.append(q)
+        print(f"[Benchmark] 从实验数据集读取 {len(questions)} 题")
+    else:
+        # 从标准数据集读取
+        query = select(BenchmarkDataset)
+        
+        if request.subject:
+            query = query.where(BenchmarkDataset.subject == request.subject)
+        if request.year:
+            query = query.where(BenchmarkDataset.year == request.year)
+        
+        # 先获取所有符合条件的题目（不限制数量）
+        result = await session.execute(query)
+        questions = list(result.scalars().all())
     
-    if request.subject:
-        query = query.where(BenchmarkDataset.subject == request.subject)
-    if request.year:
-        query = query.where(BenchmarkDataset.year == request.year)
+    # 应用随机种子打乱顺序（Python层面实现）
+    if request.random_seed is not None:
+        import random
+        rng = random.Random(request.random_seed)
+        rng.shuffle(questions)
+        print(f"[Benchmark] 使用随机种子 {request.random_seed}，打乱顺序后选取")
+    else:
+        print(f"[Benchmark] 未使用随机种子，按数据库顺序选取")
     
-    if request.mode == "random":
-        query = query.order_by(func.random()).limit(100)
-    
-    result = await session.execute(query)
-    questions = result.scalars().all()
+    # 限制题目数量（在打乱后限制）
+    if request.max_questions and len(questions) > request.max_questions:
+        questions = questions[:request.max_questions]
+    elif request.mode == "random" and len(questions) > 100:
+        questions = questions[:100]
     
     if not questions:
         raise HTTPException(status_code=400, detail="没有可用的测试题目")
     
-    # 初始化任务状态
-    current_test_task = {
+    # 🔥 关键修复：确保前一个实验的完成状态被持久化，再启动新实验
+    if current_test_task["is_running"]:
+        print("[Benchmark] 警告：已有实验在运行，等待其完成...")
+        # 等待一小段时间，让前一个实验完成
+        await asyncio.sleep(3)
+    
+    # 🔥 关键修复：保存前一个实验的完成状态（如果已完成）
+    previous_completed = (
+        not current_test_task["is_running"] and 
+        current_test_task["current"] > 0 and 
+        current_test_task["current"] >= current_test_task["total"]
+    )
+    
+    # 初始化任务状态 - 完全重置所有字段
+    current_test_task.clear()
+    current_test_task.update({
         "is_running": True,
         "expert_id": request.expert_id,
         "mode": request.mode,
         "total": len(questions),
         "current": 0,
-        "current_question": "",
+        "current_question": f"开始实验: {request.experiment_id or 'N/A'}",
         "start_time": datetime.now(),
         "error": None,
-        "stopped": False
-    }
+        "stopped": False,
+        "experiment_id": request.experiment_id,
+        "config": {
+            "random_seed": request.random_seed,
+            "use_rag": request.use_rag,
+            "use_expert_routing": request.use_expert_routing,
+            "enable_iteration": request.enable_iteration,
+            "max_questions": request.max_questions
+        },
+        "task": None,
+        "previous_completed": previous_completed  # 标记前一个实验已完成
+    })
     
     # 后台运行测试
-    task = asyncio.create_task(run_benchmark_test(questions, request.expert_id))
+    task = asyncio.create_task(run_benchmark_test(
+        questions, 
+        request.expert_id,
+        request.experiment_id,
+        request.use_rag,
+        request.use_expert_routing,
+        request.enable_iteration
+    ))
     current_test_task["task"] = task
     
     return {
@@ -342,15 +564,9 @@ async def stop_benchmark():
         print(f"[Benchmark] 已取消后台任务，当前进度: {stopped_at}")
     
     return {
-        "success": True, 
+        "success": True,
         "message": "测试已停止",
         "stopped_at": stopped_at
-    }
-    
-    return {
-        "success": True,
-        "message": "测试已停止，正在结算...",
-        "stopped_at": current_test_task["current"]
     }
 
 
@@ -383,7 +599,9 @@ async def reset_benchmark():
         "start_time": None,
         "error": None,
         "stopped": False,
-        "task": None
+        "task": None,
+        "experiment_id": None,
+        "config": {}
     }
     
     msg = "基准测试状态已重置"
@@ -454,6 +672,7 @@ async def get_test_progress(
         "total": current_test_task["total"],
         "current_question": current_test_task["current_question"],
         "elapsed_time": elapsed,
+        "experiment_id": current_test_task.get("experiment_id"),
         "recent_results": recent_results
     }
 
@@ -464,22 +683,26 @@ async def get_results(
     page_size: int = 20,
     filter: str = "all",  # 参数名改为 filter，与前端的参数名一致
     subject: Optional[str] = None,
+    experiment_config: Optional[str] = None,
     session: AsyncSession = Depends(get_async_session)
 ):
     """获取测试结果列表"""
     # 构建查询
     query = select(BenchmarkResult).join(BenchmarkDataset)
-    
+
     if filter == "correct":
         query = query.where(BenchmarkResult.is_correct == True)
     elif filter == "wrong":
         query = query.where(BenchmarkResult.is_correct == False)
     elif filter == "low_score":
         query = query.where(BenchmarkResult.overall_score < 3)
-    
+
     if subject:
         query = query.where(BenchmarkDataset.subject == subject)
-    
+
+    if experiment_config:
+        query = query.where(BenchmarkResult.experiment_config == experiment_config)
+
     # 统计总数
     count_query = select(func.count(BenchmarkResult.id))
     if filter == "correct":
@@ -488,6 +711,8 @@ async def get_results(
         count_query = count_query.where(BenchmarkResult.is_correct == False)
     elif filter == "low_score":
         count_query = count_query.where(BenchmarkResult.overall_score < 3)
+    if experiment_config:
+        count_query = count_query.where(BenchmarkResult.experiment_config == experiment_config)
     
     total_result = await session.execute(count_query)
     total = total_result.scalar() or 0
@@ -502,19 +727,19 @@ async def get_results(
     # 格式化结果
     items = []
     
-    # 先查询所有SFT数据的问题列表（用于判断是否已加入知识库）
-    from app.models.database import SFTData
-    sft_result = await session.execute(
-        select(SFTData.instruction).distinct()
-    )
-    sft_questions = set(sft_result.scalars().all())
-    
     for r in results:
         dataset = await session.get(BenchmarkDataset, r.dataset_id)
         question = dataset.question if dataset else ""
         
-        # 检查是否已在知识库中（通过问题匹配）
-        is_in_knowledge_base = question in sft_questions
+        # 检查是否已加入知识库（通过is_in_iteration_queue或查询knowledge表）
+        is_in_knowledge_base = r.is_in_iteration_queue
+        if not is_in_knowledge_base and question:
+            # 双重检查knowledge表
+            from app.models.database import Knowledge
+            know_result = await session.execute(
+                select(Knowledge).where(Knowledge.question == question).limit(1)
+            )
+            is_in_knowledge_base = know_result.scalar_one_or_none() is not None
         
         items.append({
             "id": r.id,
@@ -545,13 +770,16 @@ async def get_results(
 @router.get("/report")
 async def get_benchmark_report(
     expert_id: Optional[int] = None,
+    experiment_config: Optional[str] = None,
     session: AsyncSession = Depends(get_async_session)
 ):
-    """生成详细的评测报告 - 支持实验对比"""
+    """生成详细的评测报告 - 支持按实验配置过滤"""
     # 基础统计
     query = select(BenchmarkResult)
     if expert_id:
         query = query.where(BenchmarkResult.expert_id == expert_id)
+    if experiment_config:
+        query = query.where(BenchmarkResult.experiment_config == experiment_config)
     
     result = await session.execute(query)
     results = result.scalars().all()
@@ -731,35 +959,130 @@ async def add_to_iteration(
     request: AddToIterationRequest,
     session: AsyncSession = Depends(get_async_session)
 ):
-    """将错题加入迭代队列（仅标记，不立即生成）"""
+    """将错题加入知识库（直接入库）"""
+    from app.services.iteration.data_generator import data_generator
+    
     added_count = 0
-    already_in_queue = 0
+    already_in_knowledge = 0
+    failed_count = 0
     
     for result_id in request.result_ids:
         result = await session.get(BenchmarkResult, result_id)
         if not result:
             continue
         
-        # 检查是否已在队列中
-        if result.is_in_iteration_queue:
-            already_in_queue += 1
+        # 获取题目信息
+        dataset = await session.get(BenchmarkDataset, result.dataset_id)
+        if not dataset:
             continue
         
-        # 仅标记为待处理，不立即生成
-        result.is_in_iteration_queue = True
-        result.is_processed = False
-        added_count += 1
+        # 检查是否已在知识库中（通过question去重）
+        from sqlalchemy import select, func
+        existing = await session.execute(
+            select(Knowledge).where(
+                Knowledge.question == dataset.question
+            ).limit(1)
+        )
+        if existing.scalar_one_or_none():
+            already_in_knowledge += 1
+            continue
+        
+        try:
+            # 获取专家学科信息
+            expert = await session.get(Expert, result.expert_id)
+            expert_subject = expert.subject if expert else "通用"
+            
+            # 判断是否为选择题（有A/B/C/D选项）
+            is_choice_question = bool(re.search(r'[A-D][\.\s][\s\S]*?[A-D][\.\s]', dataset.question)) or \
+                                bool(re.search(r'\n[\s]*[A-D][\.\s]', dataset.question))
+            
+            quality_result = None  # 初始化为None
+            
+            if is_choice_question:
+                # 选择题：生成解题模板范式
+                corrected_answer = await generate_choice_template(
+                    dataset.question, 
+                    dataset.correct_answer,
+                    result.model_answer,
+                    expert_subject
+                )
+                knowledge_type = "template"
+                quality_score = 4.5
+            else:
+                # 非选择题：调用云端质检获取纠正后的答案
+                from app.services.iteration.quality_checker import QualityChecker
+                checker = QualityChecker()
+                
+                quality_result = await checker.check_answer(
+                    question=dataset.question,
+                    local_answer=result.model_answer,
+                    expert_subject=expert_subject
+                )
+                
+                if quality_result and quality_result.get("corrected_answer"):
+                    corrected_answer = quality_result["corrected_answer"]
+                    knowledge_type = quality_result.get("knowledge_type", "qa")
+                    quality_score = quality_result.get("overall_score", result.overall_score or 3.0)
+                else:
+                    # 云端质检失败
+                    corrected_answer = f"【参考答案】\n{dataset.correct_answer}\n\n【原答案】\n{result.model_answer}"
+                    knowledge_type = "qa"
+                    quality_score = result.overall_score or 3.0
+            
+            # 生成embedding（基于问题和答案）
+            from app.utils.embedding import embedding_service
+            content = f"问题：{dataset.question}\n答案：{corrected_answer}"
+            embedding = embedding_service.encode(content)
+            
+            # 创建知识记录
+            knowledge = Knowledge(
+                expert_id=result.expert_id,
+                question=dataset.question,
+                answer=corrected_answer,
+                embedding=embedding.tolist() if hasattr(embedding, 'tolist') else embedding,
+                meta_data={
+                    "original_answer": result.model_answer,
+                    "correct_answer": dataset.correct_answer,
+                    "source": "benchmark_wrong_answer",
+                    "benchmark_result_id": result.id,
+                    "quality_score": quality_score,
+                    "knowledge_type": knowledge_type,
+                    "cloud_corrected": quality_result is not None
+                },
+                knowledge_type=knowledge_type,
+                source_type="wrong_answer_extracted",
+                quality_score=quality_score
+            )
+            session.add(knowledge)
+            
+            # 更新专家知识计数
+            expert = await session.get(Expert, result.expert_id)
+            if expert:
+                expert.knowledge_count += 1
+            
+            # 标记为已处理
+            result.is_in_iteration_queue = True
+            result.is_processed = True
+            added_count += 1
+            
+        except Exception as e:
+            print(f"[AddToKnowledge] 处理失败 (ID={result_id}): {e}")
+            failed_count += 1
+            continue
     
     await session.commit()
     
-    msg = f"成功将 {added_count} 道错题加入迭代队列"
-    if already_in_queue > 0:
-        msg += f"（{already_in_queue} 道已在队列中）"
+    msg = f"成功将 {added_count} 道错题加入知识库"
+    if already_in_knowledge > 0:
+        msg += f"（{already_in_knowledge} 道已存在）"
+    if failed_count > 0:
+        msg += f"，{failed_count} 道处理失败"
     
     return {
         "success": True,
         "added_count": added_count,
-        "already_in_queue": already_in_queue,
+        "already_in_queue": already_in_knowledge,
+        "failed_count": failed_count,
         "message": msg
     }
 
@@ -1153,13 +1476,25 @@ async def _import_from_github(session: AsyncSession, url: str) -> int:
 
 # ============= 报告辅助函数 =============
 
-async def _generate_detailed_report(session: AsyncSession, expert_id: Optional[int] = None) -> Dict:
-    """生成详细测试报告（内部函数）"""
+async def _generate_detailed_report(session: AsyncSession, expert_id: Optional[int] = None, experiment_config: Optional[str] = None, experiment_id: Optional[str] = None) -> Dict:
+    """生成详细测试报告（内部函数）
+
+    Args:
+        expert_id: 专家ID过滤
+        experiment_config: 实验配置标识，如 "routing=True,rag=False"
+        experiment_id: 实验ID（优先使用，用于区分同配置的多轮实验）
+    """
     # 基础统计
     query = select(BenchmarkResult)
     if expert_id:
         query = query.where(BenchmarkResult.expert_id == expert_id)
     
+    # 🔥 关键修复：优先使用 experiment_id 过滤，区分同配置的多轮实验
+    if experiment_id:
+        query = query.where(BenchmarkResult.experiment_id == experiment_id)
+    elif experiment_config:
+        query = query.where(BenchmarkResult.experiment_config == experiment_config)
+
     result = await session.execute(query)
     results = result.scalars().all()
     
@@ -1340,16 +1675,42 @@ async def compare_reports(request: Dict):
 
 # ============= 后台任务 =============
 
-async def run_benchmark_test(questions: List[BenchmarkDataset], expert_id: Optional[int] = None):
-    """后台运行基准测试"""
+async def run_benchmark_test(
+    questions: List[BenchmarkDataset], 
+    expert_id: Optional[int] = None,
+    experiment_id: Optional[str] = None,
+    use_rag: bool = True,
+    use_expert_routing: bool = True,
+    enable_iteration: bool = False  # 默认禁用，必须显式启用
+):
+    """后台运行基准测试（简化参数版）"""
     global current_test_task
     
+    print(f"\n[🚀 后台任务启动] 共 {len(questions)} 道题目")
+    print(f"[配置确认] 路由={use_expert_routing}, RAG={use_rag}, 迭代={enable_iteration}")
+    
+    # 🔥 生成实验配置标识 - 区分不同实验模式
+    experiment_config = f"routing={use_expert_routing},rag={use_rag}"
+    print(f"[实验配置标识] {experiment_config}")
+    
+    print("[DEBUG] About to create AsyncSessionLocal...")
     async with AsyncSessionLocal() as session:
+        print(f"[DEBUG] Session created, entering try block...")
         try:
-            # 如果指定了专家，使用指定专家；否则自动路由
+            # 如果指定了专家，使用指定专家；否则根据配置决定是否自动路由
             expert = None
             if expert_id:
                 expert = await session.get(Expert, expert_id)
+                print(f"[Benchmark] 使用指定专家: {expert.name if expert else 'None'}")
+            elif use_expert_routing:
+                print("[Benchmark] 使用自动路由（专家路由启用）")
+            else:
+                print("[Benchmark] 使用通用专家（专家路由禁用）")
+            
+            if not questions:
+                print("[Benchmark] 警告: 题目列表为空!")
+                current_test_task["is_running"] = False
+                return
             
             for i, question in enumerate(questions):
                 # 检查是否被停止（取消标志）
@@ -1370,23 +1731,34 @@ async def run_benchmark_test(questions: List[BenchmarkDataset], expert_id: Optio
                 current_test_task["current"] = i + 1
                 current_test_task["current_question"] = question.question[:50] + "..."
                 
-                # 自动路由: 如果没有指定专家，根据题目学科匹配
+                # 确定使用的专家
                 current_expert = expert
                 if not current_expert:
-                    # 根据题目学科查找或创建专家
-                    current_expert = await expert_pool.get_or_create_expert(
-                        session, 
-                        subject=question.subject
-                    )
+                    if use_expert_routing:
+                        # 自动路由: 根据题目学科查找或创建专家
+                        current_expert = await expert_pool.get_or_create_expert(
+                            session, 
+                            subject=question.subject
+                        )
+                    else:
+                        # 禁用专家路由: 使用通用专家
+                        current_expert = await expert_pool.get_or_create_expert(
+                            session, 
+                            subject="通用"
+                        )
                 
-                # 检查是否已测试过
-                existing = await session.execute(
-                    select(BenchmarkResult).where(
-                        BenchmarkResult.dataset_id == question.id,
-                        BenchmarkResult.expert_id == current_expert.id
-                    ).limit(1)
+                # 检查是否已测试过（🔥 用 experiment_id 区分，同配置多轮不会互相跳过）
+                dedup_query = select(BenchmarkResult).where(
+                    BenchmarkResult.dataset_id == question.id,
+                    BenchmarkResult.expert_id == current_expert.id,
                 )
+                if experiment_id:
+                    dedup_query = dedup_query.where(BenchmarkResult.experiment_id == experiment_id)
+                else:
+                    dedup_query = dedup_query.where(BenchmarkResult.experiment_config == experiment_config)
+                existing = await session.execute(dedup_query.limit(1))
                 if existing.scalar_one_or_none():
+                    print(f"[题目 {i+1}] 已测试过（实验: {experiment_id or experiment_config}），跳过")
                     continue
                 
                 # 调用模型回答（检查停止标志）
@@ -1397,16 +1769,33 @@ async def run_benchmark_test(questions: List[BenchmarkDataset], expert_id: Optio
                 
                 # 使用超时包装LLM调用，使取消能更快响应
                 try:
+                    # 构建当前实验模式描述
+                    mode_desc = []
+                    if use_expert_routing:
+                        mode_desc.append(f"专家={current_expert.subject}")
+                    else:
+                        # Baseline模式：不使用任何专家prompt
+                        mode_desc.append("无专家/Baseline")
+                    if use_rag:
+                        mode_desc.append("RAG✓")
+                    else:
+                        mode_desc.append("RAG✗")
+                    
+                    print(f"\n[题目 {i+1}/{len(questions)}] [{'/'.join(mode_desc)}]")
+                    print(f"[问题] {question.question[:60]}...")
+                    
                     model_response = await asyncio.wait_for(
                         llm_service.generate(
                             session=session,
                             query=question.question,
                             expert=current_expert,
-                            use_rag=True
+                            use_rag=use_rag,  # 实验变量：是否使用RAG
+                            use_expert_routing=use_expert_routing  # 实验变量：是否使用专家路由（Baseline禁用）
                         ),
-                        timeout=60.0  # 60秒超时（LLM生成可能需要较长时间）
+                        timeout=120.0  # 120秒超时（LLM生成可能需要较长时间）
                     )
                     model_answer = model_response["answer"]
+                    print(f"[回答] {model_answer[:80]}...")
                 except asyncio.TimeoutError:
                     model_answer = "[回答生成超时]"
                     print(f"[Benchmark] 问题 {i+1} LLM调用超时")
@@ -1451,17 +1840,19 @@ async def run_benchmark_test(questions: List[BenchmarkDataset], expert_id: Optio
                     correct_answers = re.findall(r'[A-D]', question.correct_answer.upper())
                     is_correct = len(set(model_answers) & set(correct_answers)) > 0
                 
-                # 保存结果
+                # 保存结果（处理 None 值和缺失字段）
                 result = BenchmarkResult(
                     dataset_id=question.id,
                     expert_id=current_expert.id,
                     model_answer=model_answer,
                     is_correct=is_correct,
-                    accuracy_score=quality_result["accuracy_score"] if quality_result else 0,
-                    completeness_score=quality_result["completeness_score"] if quality_result else 0,
-                    educational_score=quality_result["educational_score"] if quality_result else 0,
-                    overall_score=quality_result["overall_score"] if quality_result else 0,
-                    suggestions=quality_result.get("improvement_suggestions", "") if quality_result else ""
+                    accuracy_score=(quality_result.get("accuracy_score") or 0) if quality_result else 0,
+                    completeness_score=(quality_result.get("completeness_score") or 0) if quality_result else 0,
+                    educational_score=(quality_result.get("educational_score") or 0) if quality_result else 0,
+                    overall_score=(quality_result.get("overall_score") or 0) if quality_result else 0,
+                    suggestions=quality_result.get("improvement_suggestions", "") if quality_result else "",
+                    experiment_config=experiment_config,  # 🔥 保存实验配置标识
+                    experiment_id=experiment_id  # 🔥 保存实验ID，用于区分同配置的多轮实验
                 )
                 session.add(result)
                 await session.commit()
@@ -1469,16 +1860,66 @@ async def run_benchmark_test(questions: List[BenchmarkDataset], expert_id: Optio
                 # 延迟5秒避免API限流（Kimi API RPM限制：3次/分钟）
                 await asyncio.sleep(5)
             
-            current_test_task["is_running"] = False
+            # 🔥 修复：先生成报告并立即通知实验完成
+            # 打印实验完成总结
+            print("\n" + "="*60)
+            print("[🎉 实验完成] 结果汇总")
+            print("="*60)
+            print(f"[配置] 路由={use_expert_routing}, RAG={use_rag}, 迭代={enable_iteration}")
             
             # 测试完成，自动生成并保存报告
             try:
-                print("[Benchmark] 测试完成，正在生成报告...")
-                report = await _generate_detailed_report(session, expert_id)
+                print("[Benchmark] 正在生成详细报告...")
+                report = await _generate_detailed_report(session, expert_id, experiment_config, experiment_id)
                 saved_path = report_saver.save_report(report)
-                print(f"[Benchmark] 报告已自动保存: {saved_path}")
+                
+                # 提取关键指标
+                summary = report.get("summary", {})
+                accuracy = summary.get("accuracy_rate", 0)
+                avg_score = summary.get("avg_score", 0)
+                
+                print(f"[结果] 准确率: {accuracy}%, 平均得分: {avg_score}")
+                print(f"[报告] 已保存: {saved_path}")
+                print("="*60 + "\n")
             except Exception as report_e:
                 print(f"[Benchmark] 保存报告失败: {report_e}")
+            
+            # 🔥 关键修复：先设置完成状态，确保前端能立即看到
+            current_test_task["is_running"] = False
+            current_test_task["current_question"] = f"实验完成: {experiment_id or 'N/A'}"
+            
+            # 🔥 关键修复：先提交会话，确保数据持久化
+            await session.commit()
+            
+            # 如果有实验ID，立即通知实验系统完成（不等待入库）
+            if experiment_id:
+                try:
+                    print(f"[Benchmark] 通知实验系统完成: {experiment_id}")
+                    report = await _generate_detailed_report(session, expert_id, experiment_config, experiment_id)
+                    
+                    # 调用实验系统的完成接口
+                    from app.api.experiments import complete_experiment
+                    await complete_experiment(experiment_id, report)
+                    print(f"[Benchmark] 实验 {experiment_id} 已完成通知")
+                except Exception as exp_e:
+                    print(f"[Benchmark] 通知实验系统失败: {exp_e}")
+            
+            # 🔥 关键修复：自动入库改为后台异步执行，不阻塞实验流程
+            if enable_iteration:
+                async def background_auto_add():
+                    # 🔥 使用独立的数据库会话，避免并发冲突
+                    async with AsyncSessionLocal() as bg_session:
+                        try:
+                            print("[Benchmark] 开始后台自动处理错题入知识库...")
+                            auto_added = await auto_add_wrong_answers_to_knowledge(bg_session, expert_id)
+                            print(f"[Benchmark] 后台自动入库完成: {auto_added} 条")
+                        except Exception as auto_e:
+                            print(f"[Benchmark] 后台自动入库失败: {auto_e}")
+                
+                # 启动后台入库任务，不等待完成
+                asyncio.create_task(background_auto_add())
+            else:
+                print("[Benchmark] 迭代/自动入库已禁用（消融实验模式），跳过知识库更新")
             
         except asyncio.CancelledError:
             # 任务被取消（用户点击停止）
@@ -1488,7 +1929,10 @@ async def run_benchmark_test(questions: List[BenchmarkDataset], expert_id: Optio
             # 即使被停止也尝试保存已完成部分的报告
             try:
                 print("[Benchmark] 正在保存已完成的报告...")
-                report = await _generate_detailed_report(session, expert_id)
+                # 安全获取 experiment_config 和 experiment_id
+                local_exp_config = locals().get('experiment_config', 'unknown')
+                local_exp_id = locals().get('experiment_id', None)
+                report = await _generate_detailed_report(session, expert_id, local_exp_config, local_exp_id)
                 report["experiment_info"]["stopped"] = True
                 saved_path = report_saver.save_report(report)
                 print(f"[Benchmark] 报告已保存: {saved_path}")
@@ -1496,15 +1940,172 @@ async def run_benchmark_test(questions: List[BenchmarkDataset], expert_id: Optio
                 print(f"[Benchmark] 保存报告失败: {report_e}")
             
         except Exception as e:
+            import traceback
             current_test_task["is_running"] = False
             current_test_task["error"] = str(e)
             print(f"基准测试出错: {e}")
+            print(f"[DEBUG] Error type: {type(e)}")
+            print(f"[DEBUG] Locals: {list(locals().keys())}")
+            traceback.print_exc()
             
             # 即使出错也尝试保存已完成的报告
             try:
-                report = await _generate_detailed_report(session, expert_id)
+                # 安全获取 experiment_config 和 experiment_id
+                local_exp_config = locals().get('experiment_config', 'unknown')
+                local_exp_id = locals().get('experiment_id', None)
+                report = await _generate_detailed_report(session, expert_id, local_exp_config, local_exp_id)
                 report["experiment_info"]["error"] = str(e)
                 saved_path = report_saver.save_report(report)
-                print(f"[Benchmark] 错误报告已保存: {saved_path}")
             except Exception as report_e:
                 print(f"[Benchmark] 保存错误报告失败: {report_e}")
+
+
+# ============= 自动入库功能 =============
+
+async def auto_add_wrong_answers_to_knowledge(
+    session: AsyncSession,
+    expert_id: Optional[int] = None,
+    low_score_threshold: float = 4.0  # 正确但分数低于此值（<4.0）也入知识库优化
+) -> int:
+    """
+    评测完成后自动将错题和低分正确题加入知识库
+    
+    根据论文质量评估体系：
+    - 总分 >= 4.0：高质量，直接入库
+    - 总分 < 4.0：需要优化，云端修正后入库
+    
+    Args:
+        session: 数据库会话
+        expert_id: 专家ID（可选）
+        low_score_threshold: 低分阈值（默认4.0），低于此值的题云端修正后入库
+    
+    Returns:
+        成功入库的数量
+    """
+    from sqlalchemy import select, and_, or_
+    
+    # 查询需要入库的题：
+    # 1. 错题 (is_correct = False)
+    # 2. 正确但分数低的 (is_correct = True AND overall_score < threshold)
+    query = select(BenchmarkResult, BenchmarkDataset).join(
+        BenchmarkDataset,
+        BenchmarkResult.dataset_id == BenchmarkDataset.id
+    ).where(
+        or_(
+            BenchmarkResult.is_correct == False,
+            and_(
+                BenchmarkResult.is_correct == True,
+                BenchmarkResult.overall_score < low_score_threshold
+            )
+        )
+    ).where(
+        BenchmarkResult.is_in_iteration_queue == False  # 未入库的
+    )
+    
+    if expert_id:
+        query = query.where(BenchmarkResult.expert_id == expert_id)
+    
+    result = await session.execute(query)
+    rows = result.fetchall()
+    
+    if not rows:
+        print(f"[AutoAdd] 没有需要入库的题目")
+        return 0
+    
+    print(f"[AutoAdd] 找到 {len(rows)} 道需要入库的题目（错题或低分正确题）")
+    
+    added_count = 0
+    for benchmark_result, dataset in rows:
+        # 检查是否已存在
+        existing = await session.execute(
+            select(Knowledge).where(Knowledge.question == dataset.question).limit(1)
+        )
+        if existing.scalar_one_or_none():
+            print(f"[AutoAdd] 跳过已存在: {dataset.question[:40]}...")
+            benchmark_result.is_in_iteration_queue = True  # 标记为已处理
+            continue
+        
+        try:
+            # 获取专家学科
+            expert = await session.get(Expert, benchmark_result.expert_id)
+            expert_subject = expert.subject if expert else "通用"
+            
+            # 判断是否为选择题
+            is_choice_question = bool(re.search(r'[A-D][\.\s][\s\S]*?[A-D][\.\s]', dataset.question)) or \
+                                bool(re.search(r'\n[\s]*[A-D][\.\s]', dataset.question))
+            
+            if is_choice_question:
+                # 选择题：生成解题模板
+                corrected_answer = await generate_choice_template(
+                    dataset.question,
+                    dataset.correct_answer,
+                    benchmark_result.model_answer,
+                    expert_subject
+                )
+                knowledge_type = "template"
+                quality_score = max(benchmark_result.overall_score, 4.0)  # 自动生成的给高分
+            else:
+                # 非选择题：调用云端质检
+                from app.services.iteration.quality_checker import QualityChecker
+                checker = QualityChecker()
+                
+                quality_result = await checker.check_answer(
+                    question=dataset.question,
+                    local_answer=benchmark_result.model_answer,
+                    expert_subject=expert_subject
+                )
+                
+                if quality_result and quality_result.get("corrected_answer"):
+                    corrected_answer = quality_result["corrected_answer"]
+                    knowledge_type = quality_result.get("knowledge_type", "qa")
+                    quality_score = quality_result.get("overall_score", benchmark_result.overall_score or 3.0)
+                else:
+                    # 云端失败，用基础格式
+                    corrected_answer = f"【参考答案】\n{dataset.correct_answer}\n\n【解答】\n{benchmark_result.model_answer}"
+                    knowledge_type = "qa"
+                    quality_score = benchmark_result.overall_score or 3.0
+            
+            # 生成embedding并入库
+            from app.utils.embedding import embedding_service
+            content = f"问题：{dataset.question}\n答案：{corrected_answer}"
+            embedding = embedding_service.encode(content)
+            
+            knowledge = Knowledge(
+                expert_id=benchmark_result.expert_id,
+                question=dataset.question,
+                answer=corrected_answer,
+                embedding=embedding.tolist() if hasattr(embedding, 'tolist') else embedding,
+                meta_data={
+                    "original_answer": benchmark_result.model_answer,
+                    "correct_answer": dataset.correct_answer,
+                    "source": "benchmark_auto_added",
+                    "benchmark_result_id": benchmark_result.id,
+                    "quality_score": quality_score,
+                    "knowledge_type": knowledge_type,
+                    "auto_added": True,
+                    "is_wrong": not benchmark_result.is_correct,
+                    "original_score": benchmark_result.overall_score
+                },
+                knowledge_type=knowledge_type,
+                source_type="wrong_answer_extracted",
+                quality_score=quality_score
+            )
+            session.add(knowledge)
+            
+            # 更新结果状态
+            benchmark_result.is_in_iteration_queue = True
+            benchmark_result.is_processed = True
+            added_count += 1
+            
+            print(f"[AutoAdd] 已入库: {dataset.question[:40]}... (类型:{knowledge_type}, 分数:{quality_score})")
+            
+            # API限流保护
+            await asyncio.sleep(3)
+            
+        except Exception as e:
+            print(f"[AutoAdd] 入库失败 (ID={benchmark_result.id}): {e}")
+            continue
+    
+    await session.commit()
+    print(f"[AutoAdd] 完成: 成功入库 {added_count}/{len(rows)} 条")
+    return added_count

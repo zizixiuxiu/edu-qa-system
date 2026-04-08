@@ -1,7 +1,7 @@
 """聊天API - 核心问答接口"""
 from fastapi import APIRouter, Depends, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import Optional
+from typing import Optional, Dict, Any
 import uuid
 import time
 import base64
@@ -17,6 +17,22 @@ from app.services.tier0 import tier0_ingest_service  # 新增
 from app.models.database import Session as ChatSession
 
 router = APIRouter(prefix="/chat", tags=["问答"])
+
+
+def get_current_experiment_config() -> Optional[Dict[str, Any]]:
+    """获取当前实验配置"""
+    try:
+        from app.api.experiments import _current_experiment_id, _experiment_queue
+        
+        if not _current_experiment_id:
+            return None
+        
+        for exp in _experiment_queue:
+            if exp.id == _current_experiment_id and exp.status == "running":
+                return exp.config.dict()
+        return None
+    except Exception:
+        return None
 
 
 @router.post("/send", response_model=ResponseBase)
@@ -37,31 +53,57 @@ async def send_message(
     start_time = time.time()
     
     try:
-        # Step 1: VL学科识别
+        # 处理纯图片情况：如果 query 为空，使用默认提示
+        user_query = request.query if request.query.strip() else "请解答图片中的题目"
+        
+        # 获取当前实验配置
+        exp_config = get_current_experiment_config()
+        
+        # Step 1: VL学科识别（仅当启用专家路由时）
         vl_start = time.time()
-        subject_info = await vl_service.identify_subject(
-            request.query, 
-            request.image
-        )
+        use_expert_routing = True  # 默认启用
+        use_rag = settings.ENABLE_RAG  # 默认使用全局配置
+        
+        if exp_config:
+            use_expert_routing = exp_config.get("use_expert_routing", True)
+            use_rag = exp_config.get("use_rag", settings.ENABLE_RAG)  # 简化：use_rag 同时控制知识库
+            print(f"[Chat] 实验模式: expert_routing={use_expert_routing}, rag={use_rag}")
+        
+        if use_expert_routing:
+            subject_info = await vl_service.identify_subject(
+                user_query, 
+                request.image
+            )
+            subject = subject_info["subject"]
+        else:
+            # Baseline模式：强制使用通用专家
+            subject_info = {"subject": "通用", "confidence": "baseline"}
+            subject = "通用"
+        
         vl_time = time.time() - vl_start
         
-        print(f"[Chat] 学科识别: '{request.query[:50]}...' -> {subject_info['subject']} (置信度: {subject_info.get('confidence', 'unknown')})")
+        query_display = request.query[:50] if request.query else "[图片]"
+        print(f"[Chat] 学科识别: '{query_display}...' -> {subject} (路由: {'专家' if use_expert_routing else '通用'})")
         
         # Step 2: 获取或创建学科专家
         expert = await expert_pool.get_or_create_expert(
             db_session,
-            subject_info["subject"]
+            subject
         )
         
-        # Step 3: 生成回答（使用级联RAG检索）
-        use_rag = settings.ENABLE_RAG and expert.knowledge_count > 0
+        # Step 3: 生成回答（根据实验配置决定是否使用RAG）
+        if exp_config:
+            use_rag = use_rag and expert.knowledge_count > 0
+        else:
+            use_rag = settings.ENABLE_RAG and expert.knowledge_count > 0
         
         generation_result = await llm_service.generate(
             session=db_session,
             expert=expert,
-            query=request.query,
+            query=user_query,  # 使用处理后的查询
             image=request.image,
-            use_rag=use_rag
+            use_rag=use_rag,
+            use_expert_routing=use_expert_routing  # 🔥 传递专家路由开关
         )
         
         # 记录检索统计
@@ -74,7 +116,7 @@ async def send_message(
         chat_session = ChatSession(
             session_uuid=session_uuid,
             expert_id=expert.id,
-            user_query=request.query,
+            user_query=user_query,  # 使用处理后的查询
             user_image=request.image,
             local_answer=generation_result["answer"],
             used_knowledge_ids=[k["id"] for k in generation_result.get("used_knowledges", [])],
@@ -96,7 +138,7 @@ async def send_message(
                 _async_quality_check(
                     db_session, 
                     chat_session.id,
-                    request.query,
+                    user_query,  # 使用处理后的查询
                     generation_result["answer"],
                     expert.subject
                 )
@@ -202,17 +244,32 @@ async def _async_quality_check(
 
 @router.post("/upload-image")
 async def upload_image(file: UploadFile = File(...)):
-    """上传图片 - 返回base64"""
+    """上传图片 - 返回base64（带data URL前缀）"""
     try:
         content = await file.read()
         base64_image = base64.b64encode(content).decode('utf-8')
+        
+        # 根据文件扩展名确定 MIME 类型
+        filename = file.filename.lower()
+        if filename.endswith('.png'):
+            mime_type = 'image/png'
+        elif filename.endswith('.gif'):
+            mime_type = 'image/gif'
+        elif filename.endswith('.webp'):
+            mime_type = 'image/webp'
+        else:
+            mime_type = 'image/jpeg'  # 默认
+        
+        # 添加 data URL 前缀
+        data_url = f"data:{mime_type};base64,{base64_image}"
         
         return ResponseBase(
             code=200,
             message="success",
             data={
                 "filename": file.filename,
-                "base64": base64_image,
+                "base64": data_url,  # 返回完整的 data URL
+                "raw_base64": base64_image,  # 同时返回裸 base64（供API调用使用）
                 "size": len(content)
             }
         )

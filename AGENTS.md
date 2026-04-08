@@ -325,6 +325,103 @@ cd frontend && npx vite build
 - [ ] 知识库 content 是否保存完整高质量内容（非精简版）
 
 
-*最后更新: 2026-03-15*
+---
+
+### 10. 实验队列无限循环 Bug（2026-04-05）
+
+#### 问题描述
+- **错误**: 实验进度条在切换实验时无限循环跳动，系统卡在"实验完成"状态
+- **场景**: 一键运行6组实验时，FullSystem实验完成后切换到下一个实验时卡住
+- **根本原因**: 多层次的竞态条件和状态污染
+  1. **后端**: 自动入库操作阻塞了实验完成通知
+  2. **前端**: `loadQueue()` 替换整个 `currentRunningExperiment` 对象，导致状态引用丢失
+  3. **全局状态**: 新实验启动时立即重置 `current_test_task`，覆盖了完成状态
+
+#### 修复方案（多层防御）
+
+**1. 后端: 异步自动入库**
+```python
+# ✅ 正确 - 后台异步执行，不阻塞实验流程
+if enable_iteration:
+    async def background_auto_add():
+        await auto_add_wrong_answers_to_knowledge(session, expert_id)
+    
+    # 启动后台任务，不等待完成
+    asyncio.create_task(background_auto_add())
+```
+
+**2. 前端: 保持对象引用（关键）**
+```typescript
+// ✅ 正确 - 只更新字段，不替换整个对象
+const loadQueue = async () => {
+  const currentId = currentRunningExperiment.value?.id
+  experimentQueue.value = res.queue
+  
+  if (currentId && currentRunningExperiment.value) {
+    const updatedRunning = experimentQueue.value.find(e => e.id === currentId)
+    if (updatedRunning) {
+      // 只更新状态字段，保持对象引用不变！
+      currentRunningExperiment.value.status = updatedRunning.status
+      currentRunningExperiment.value.progress = updatedRunning.progress
+      // 不要替换整个对象！
+    }
+  }
+}
+```
+
+**3. 前端: 防重入锁**
+```typescript
+let isSwitchingExperiment = false
+let completedExperimentIds = new Set<string>()
+
+const startPolling = () => {
+  pollTimer = window.setInterval(async () => {
+    // 防重入锁
+    if (isSwitchingExperiment) return
+    // 去重检查
+    if (completedExperimentIds.has(currentExp.id)) return
+    
+    isSwitchingExperiment = true
+    try {
+      // 处理实验切换...
+    } finally {
+      isSwitchingExperiment = false
+    }
+  }, 2000)
+}
+```
+
+**4. 默认参数: 禁用迭代**
+```python
+class StartTestRequest(BaseModel):
+    enable_iteration: bool = False  # 默认禁用，防止意外启用
+
+async def run_benchmark_test(
+    # ...
+    enable_iteration: bool = False  # 必须显式启用
+):
+```
+
+#### 检查清单
+- [ ] 后台耗时操作使用 `asyncio.create_task()` 异步执行
+- [ ] 前端状态更新时保持对象引用（使用 `Object.assign` 或字段赋值）
+- [ ] 添加防重入锁防止竞态条件
+- [ ] 使用集合(Set)进行完成去重
+- [ ] 危险功能（如自动入库）默认禁用
+
+#### 调试技巧
+```typescript
+// 添加详细日志追踪状态变化
+console.log(`[Experiment] 轮询: 实验 ${currentExp.id} 已完成，准备切换`)
+console.log(`[Experiment] 下一个实验:`, runningExp?.name)
+
+// 检查对象引用
+console.log('currentRunningExperiment === runningExp:', 
+  currentRunningExperiment.value === runningExp)
+```
+
+---
+
+*最后更新: 2026-04-05*
 
 

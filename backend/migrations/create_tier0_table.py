@@ -111,10 +111,11 @@ def migrate() -> bool:
             # 5. 补充 experts 表字段
             alter_experts_sql = """
             ALTER TABLE experts 
-            ADD COLUMN IF NOT EXISTS tier0_count INTEGER DEFAULT 0;
+            ADD COLUMN IF NOT EXISTS tier0_count INTEGER DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
             """
             conn.execute(text(alter_experts_sql))
-            logger.info("✅ experts 表 tier0_count 字段添加成功")
+            logger.info("✅ experts 表 tier0_count 和 updated_at 字段添加成功")
             
             logger.info("🎉 数据库迁移完成！")
             return True

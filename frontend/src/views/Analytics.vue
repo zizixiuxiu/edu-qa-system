@@ -79,7 +79,7 @@
     </el-card>
 
     <!-- 实验结论（基于真实数据动态计算） -->
-    <el-card class="conclusion-card">
+    <el-card v-if="comparisonData.detailed_metrics && comparisonData.detailed_metrics.length > 0" class="conclusion-card">
       <template #header>
         <span>📝 实验数据概览 Overview</span>
       </template>
@@ -88,21 +88,21 @@
           <div class="conclusion-number">1</div>
           <div class="conclusion-content">
             <h4>总会话数量</h4>
-            <p>系统累计处理了 <strong>{{ comparisonData.detailed_metrics.reduce((sum, m) => sum + (m.total_queries || 0), 0) }}</strong> 次问答交互</p>
+            <p>系统累计处理了 <strong>{{ (comparisonData.detailed_metrics || []).reduce((sum, m) => sum + (m.total_queries || 0), 0) }}</strong> 次问答交互</p>
           </div>
         </div>
         <div class="conclusion-item">
           <div class="conclusion-number">2</div>
           <div class="conclusion-content">
             <h4>平均响应时间</h4>
-            <p>全系统平均响应时间为 <strong>{{ Math.round(comparisonData.detailed_metrics.reduce((sum, m) => sum + (m.avg_response_time || 0), 0) / (comparisonData.detailed_metrics.length || 1)) }}ms</strong></p>
+            <p>全系统平均响应时间为 <strong>{{ Math.round((comparisonData.detailed_metrics || []).reduce((sum, m) => sum + (m.avg_response_time || 0), 0) / ((comparisonData.detailed_metrics || []).length || 1)) }}ms</strong></p>
           </div>
         </div>
         <div class="conclusion-item">
           <div class="conclusion-number">3</div>
           <div class="conclusion-content">
             <h4>知识库总量</h4>
-            <p>当前知识库共有 <strong>{{ iterationData.knowledge_growth[iterationData.knowledge_growth.length - 1] || 0 }}</strong> 条知识点</p>
+            <p>当前知识库共有 <strong>{{ (iterationData?.knowledge_growth?.length || 0) > 0 ? iterationData.knowledge_growth[iterationData.knowledge_growth.length - 1] : 0 }}</strong> 条知识点</p>
           </div>
         </div>
       </div>
@@ -208,7 +208,7 @@ function handleResize() {
 async function loadComparisonData() {
   try {
     const res: any = await experimentApi.getComparison()
-    if (res.code === 200) {
+    if (res.code === 200 && res.data && res.data.modes) {
       comparisonData.value = res.data
       
       if (!responseTimeChart || !accuracyChart || !costChart) {
@@ -223,7 +223,7 @@ async function loadComparisonData() {
         xAxis: { type: 'category', data: res.data.modes.map(getModeLabel) },
         yAxis: { type: 'value', name: 'ms' },
         series: [{
-          data: res.data.avg_response_time,
+          data: res.data.avg_response_time || [],
           type: 'bar',
           itemStyle: { borderWidth: 2, borderColor: '#111' }
         }]
@@ -237,7 +237,7 @@ async function loadComparisonData() {
         xAxis: { type: 'category', data: res.data.modes.map(getModeLabel) },
         yAxis: { type: 'value', max: 100, name: '%' },
         series: [{
-          data: res.data.accuracy,
+          data: res.data.accuracy || [],
           type: 'bar',
           itemStyle: { borderWidth: 2, borderColor: '#111' }
         }]
@@ -251,11 +251,13 @@ async function loadComparisonData() {
         xAxis: { type: 'category', data: res.data.modes.map(getModeLabel) },
         yAxis: { type: 'value', name: '$' },
         series: [{
-          data: res.data.cost_per_query,
+          data: res.data.cost_per_query || [],
           type: 'bar',
           itemStyle: { borderWidth: 2, borderColor: '#111' }
         }]
       })
+    } else {
+      console.warn('对比数据为空，跳过图表更新')
     }
   } catch (error) {
     console.error('加载对比数据失败:', error)
@@ -265,7 +267,7 @@ async function loadComparisonData() {
 async function loadIterationData() {
   try {
     const res: any = await experimentApi.getIterationProgress(iterationDays.value)
-    if (res.code === 200) {
+    if (res.code === 200 && res.data && res.data.dates) {
       iterationData.value = res.data
       
       if (!iterationChart) {
@@ -297,7 +299,7 @@ async function loadIterationData() {
 async function loadExpertStats() {
   try {
     const res: any = await experimentApi.getDashboard()
-    if (res.code === 200) {
+    if (res.code === 200 && res.data && res.data.expert_distribution) {
       expertStats.value = res.data.expert_distribution
       
       const data = res.data.expert_distribution.map((item: any) => ({

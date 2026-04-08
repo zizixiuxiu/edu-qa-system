@@ -35,7 +35,7 @@ class ExpertResponse(BaseModel):
 
 # ========== 问答相关 ==========
 class ChatRequest(BaseModel):
-    query: str
+    query: str = ""                       # 用户问题（纯图片时可为空）
     image: Optional[str] = None          # base64图片
     session_id: Optional[str] = None     # 续对话
 

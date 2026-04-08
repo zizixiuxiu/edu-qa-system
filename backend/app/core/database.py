@@ -13,7 +13,11 @@ from app.core.config import settings
 sync_engine = create_engine(
     settings.DATABASE_URL,
     echo=False,
-    pool_pre_ping=True
+    pool_pre_ping=True,
+    pool_size=5,
+    max_overflow=10,
+    pool_timeout=30,
+    connect_args={"connect_timeout": 10}
 )
 
 # 异步引擎（用于生产环境）
@@ -23,7 +27,10 @@ async_database_url = settings.DATABASE_URL.replace(
 async_engine = create_async_engine(
     async_database_url,
     echo=False,
-    pool_pre_ping=True
+    pool_pre_ping=True,
+    pool_size=5,
+    max_overflow=10,
+    pool_timeout=30
 )
 
 AsyncSessionLocal = sessionmaker(

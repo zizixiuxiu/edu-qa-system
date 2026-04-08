@@ -241,9 +241,11 @@ const menuRoutes = computed(() => {
   border: var(--border);
   box-shadow: var(--shadow);
   min-height: calc(100vh - 48px);
-  height: calc(100vh - 48px);
+  height: auto;
+  max-width: 100%;
   position: relative;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: visible;
   display: flex;
   flex-direction: column;
 }
@@ -251,14 +253,17 @@ const menuRoutes = computed(() => {
 @media (min-width: 1400px) {
   .main-content {
     min-height: calc(100vh - 64px);
-    height: calc(100vh - 64px);
+    height: auto;
   }
 }
 
 .content-wrapper {
   padding: 16px;
-  height: 100%;
-  overflow: hidden;
+  min-height: calc(100vh - 48px - 32px);
+  height: auto;
+  max-width: 100%;
+  overflow-x: hidden;
+  overflow-y: visible;
   display: flex;
   flex-direction: column;
 }
@@ -277,7 +282,7 @@ const menuRoutes = computed(() => {
 
 .content-wrapper > * {
   flex: 1;
-  min-height: 0;
+  min-height: auto;
 }
 
 .decor {

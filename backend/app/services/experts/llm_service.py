@@ -15,7 +15,7 @@ class LLMService:
     def __init__(self):
         self.base_url = settings.LMSTUDIO_BASE_URL
         self.api_key = settings.LMSTUDIO_API_KEY
-        self.model = settings.LOCAL_LLM_MODEL
+        self.model = settings.LOCAL_LLM_MODEL  # 使用本地模型配置
     
     async def generate(
         self,
@@ -23,10 +23,14 @@ class LLMService:
         expert: Expert,
         query: str,
         image: Optional[str] = None,
-        use_rag: bool = True
+        use_rag: bool = True,
+        use_expert_routing: bool = True
     ) -> Dict:
         """
         生成回答 - 支持级联RAG检索
+        
+        Args:
+            use_expert_routing: 是否使用专家路由（Baseline等消融实验应禁用）
         
         Returns:
             {
@@ -41,13 +45,22 @@ class LLMService:
         start_time = time.time()
         
         # 构建系统Prompt
-        system_prompt = expert_pool.get_expert_prompt(expert)
+        # Baseline实验：不使用专家prompt，直接传递问题
+        # ExpertOnly/FullSystem：使用对应学科专家的prompt
+        if use_expert_routing:
+            system_prompt = expert_pool.get_expert_prompt(expert)
+        else:
+            # 禁用专家路由时使用最简prompt（仅格式要求，无角色设定）
+            system_prompt = "请直接回答问题，不需要特殊角色设定。"
         
         # RAG检索相关知识（级联检索：专家库 + 条件触发通用库）
         used_knowledges = []
         rag_time = 0
         rag_stats = {}
         
+        # 实验参数控制：use_rag 是实验变量，必须严格遵循
+        # Baseline/use_rag=false: 禁用RAG
+        # RAGOnly/FullSystem use_rag=true: 启用RAG（如果全局开启）
         if use_rag and settings.ENABLE_RAG:
             rag_start = time.time()
             
@@ -115,16 +128,24 @@ class LLMService:
         # 构建消息
         messages = [{"role": "system", "content": system_prompt}]
         
+        # 确保 query 不为空
+        user_text = query if query.strip() else "请解答图片中的题目"
+        
+        # 🔥 修复：使用多模态格式兼容 VL 模型
+        # qwen3-vl 需要 content 为数组格式，即使是纯文本
+        content = [{"type": "text", "text": user_text}]
+        
         if image:
-            messages.append({
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": query},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image}"}}
-                ]
-            })
-        else:
-            messages.append({"role": "user", "content": query})
+            # 检查 base64 是否已经是 data URL 格式
+            if image.startswith('data:'):
+                image_url = image  # 已经是完整 URL
+            else:
+                image_url = f"data:image/jpeg;base64,{image}"  # 需要添加前缀
+            
+            content.append({"type": "image_url", "image_url": {"url": image_url}})
+            print(f"[LLM调试] 包含图片，URL长度: {len(image_url)}")
+        
+        messages.append({"role": "user", "content": content})
         
         # 调用模型
         if settings.SIMULATION_MODE:
@@ -144,30 +165,47 @@ class LLMService:
     async def _call_model(self, messages: List[Dict]) -> tuple:
         """调用本地模型"""
         import time
+        import json
         start = time.time()
+        
+        # 调试日志
+        print(f"[LLM调试] 调用模型: {self.model}")
+        print(f"[LLM调试] 消息数: {len(messages)}")
         
         try:
             async with httpx.AsyncClient() as client:
+                request_body = {
+                    "model": self.model,
+                    "messages": messages,
+                    "temperature": 0.7,
+                    "max_tokens": 8000,
+                    "stream": False
+                }
+                print(f"[LLM调试] 请求体: {json.dumps(request_body, ensure_ascii=False)[:500]}...")
+                
                 response = await client.post(
                     f"{self.base_url}/chat/completions",
                     headers={"Authorization": f"Bearer {self.api_key}"},
-                    json={
-                        "model": self.model,
-                        "messages": messages,
-                        "temperature": 0.7,
-                        "max_tokens": 2048,
-                        "stream": False
-                    },
+                    json=request_body,
                     timeout=60.0
                 )
                 response.raise_for_status()
                 result = response.json()
                 
-                answer = result["choices"][0]["message"]["content"]
+                message = result["choices"][0]["message"]
+                # 优先使用 content，如果为空则使用 reasoning_content
+                answer = message.get("content", "")
+                if not answer and message.get("reasoning_content"):
+                    answer = message.get("reasoning_content")
                 inference_time = time.time() - start
                 
                 return answer, inference_time
                 
+        except httpx.HTTPStatusError as e:
+            error_detail = e.response.text if hasattr(e, 'response') else str(e)
+            print(f"[LLM调试] HTTP错误: {e.response.status_code}, 详情: {error_detail[:500]}")
+            print(f"LLM调用失败: {e}")
+            return f"抱歉，模型调用出现问题: {str(e)}", time.time() - start
         except Exception as e:
             print(f"LLM调用失败: {e}")
             return f"抱歉，模型调用出现问题: {str(e)}", time.time() - start

@@ -75,6 +75,37 @@ class KnowledgeGenerator:
             result["knowledge_ids"].append(knowledge.id)
             
             print(f"[KnowledgeGenerator] 添加知识点: {knowledge_content[:50]}...")
+            
+            # 🔥 同步到通用知识库（让RAGOnly模式也能检索到）
+            try:
+                from app.services.experts.expert_pool import expert_pool
+                general_expert = await expert_pool.get_or_create_expert(session, subject="通用")
+                
+                # 检查通用库是否已有相似知识
+                general_duplicate = await deduplication_service.check_knowledge_duplicate(
+                    session, general_expert.id, knowledge_content
+                )
+                
+                if general_duplicate is None:
+                    general_knowledge = Knowledge(
+                        expert_id=general_expert.id,
+                        content=f"[{subject}]{knowledge_content}",  # 标记来源学科
+                        embedding=embedding,
+                        meta_data={
+                            **meta_data,
+                            "original_expert_id": expert_id,
+                            "original_subject": subject,
+                            "source_note": f"同步自{subject}专家库"
+                        },
+                        source_type="wrong_answer_extracted_synced",  # 标记为同步来源
+                        quality_score=5.0
+                    )
+                    session.add(general_knowledge)
+                    await session.flush()
+                    result["knowledge_ids"].append(general_knowledge.id)
+                    print(f"[KnowledgeGenerator] 同步到通用知识库: {knowledge_content[:40]}...")
+            except Exception as e:
+                print(f"[KnowledgeGenerator] 同步到通用库失败（不影响主流程）: {e}")
         
         # 3. 同时生成SFT数据（用于后续可能的微调）
         sft_duplicate = await deduplication_service.check_sft_data_duplicate(

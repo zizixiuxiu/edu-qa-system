@@ -23,10 +23,10 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "postgresql://postgres:password@localhost:15432/edu_qa"
     
     # ========== 模型配置 ==========
-    LMSTUDIO_BASE_URL: str = "http://localhost:1234/v1"
+    LMSTUDIO_BASE_URL: str = "http://127.0.0.1:1234/v1"
     LMSTUDIO_API_KEY: str = "lm-studio"
-    VL_MODEL_NAME: str = "qwen3-vl-4b"
-    LOCAL_LLM_MODEL: str = "qwen2.5-7b"
+    VL_MODEL_NAME: str = "qwen/qwen3-vl-4b"  # 专门用于图片识别的VLM模型
+    LOCAL_LLM_MODEL: str = "qwen/qwen3-vl-4b"  # 使用VLM模型处理所有请求
     
     # 云端API配置
     CLOUD_API_KEY: Optional[str] = None
@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     # ========== 自我迭代配置 ==========
     QUALITY_THRESHOLD: float = 4.0
     DEDUP_THRESHOLD: float = 0.92
-    ENABLE_CLOUD_QUALITY_CHECK: bool = True
+    ENABLE_CLOUD_QUALITY_CHECK: bool = True  # 启用云端质检 (Moonshot)
     ENABLE_KNOWLEDGE_UPDATE: bool = True
     
     # ========== RAG配置 ==========
@@ -58,6 +58,16 @@ class Settings(BaseSettings):
     ENABLE_CACHE: bool = True
     CACHE_TTL: int = 3600
     ENABLE_ASYNC_QUEUE: bool = True
+    
+    # ========== Redis缓存配置 (L2层) ==========
+    REDIS_ENABLED: bool = True
+    REDIS_HOST: str = "localhost"
+    REDIS_PORT: int = 6379
+    REDIS_DB: int = 0
+    REDIS_PASSWORD: Optional[str] = None
+    REDIS_TTL_EXPERT: int = 7200  # 专家缓存2小时
+    REDIS_TTL_RAG: int = 1800     # RAG结果缓存30分钟
+    REDIS_TTL_VECTOR: int = 3600  # 向量缓存1小时
     
     class Config:
         env_file = ".env"

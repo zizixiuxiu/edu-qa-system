@@ -62,16 +62,25 @@ async def list_knowledge(
     # 构建响应
     items = []
     for k in knowledges:
+        # 构建显示内容（优先用content，否则用question+answer）
+        display_content = k.content
+        question = k.question
+        answer = k.answer
+        
+        if not display_content and (question or answer):
+            display_content = f"问题：{question or ''}\n\n答案：{answer or ''}"
+        
         # 关键词过滤（在内存中过滤）
-        if keyword and keyword.lower() not in k.content.lower():
+        if keyword and keyword.lower() not in (display_content or "").lower():
             continue
             
         items.append({
             "id": k.id,
             "expert_id": k.expert_id,
             "expert_name": expert_map.get(k.expert_id, "未知专家"),
-            "content": k.content,
-            "question": k.meta_data.get("question") if k.meta_data else None,
+            "content": display_content,
+            "question": question,
+            "answer": answer,
             "source_type": k.source_type,
             "quality_score": k.quality_score,
             "usage_count": k.usage_count,
@@ -277,3 +286,94 @@ async def get_knowledge_stats(
         "expert_distribution": expert_stats,
         "avg_quality_score": round(float(avg_quality), 2)
     })
+
+
+@router.get("/export", response_model=ResponseBase)
+async def export_knowledge(
+    expert_id: Optional[int] = None,
+    min_quality: float = Query(0.0, ge=0.0, le=5.0),
+    format: str = Query("json", regex="^(json|csv|jsonl)$"),
+    session: AsyncSession = Depends(get_session)
+) -> ResponseBase:
+    """
+    导出知识库数据（用于LoRA微调）
+    
+    Args:
+        expert_id: 按专家筛选（不传则导出全部）
+        min_quality: 最低质量分数（默认0，导出全部）
+        format: 导出格式（json/csv/jsonl）
+    
+    Returns:
+        可直接用于LoRA微调的数据格式
+    """
+    try:
+        # 构建查询
+        query = select(Knowledge, Expert.name.label("expert_name"), Expert.subject.label("expert_subject")).join(
+            Expert, Knowledge.expert_id == Expert.id
+        ).where(Knowledge.quality_score >= min_quality)
+        
+        if expert_id:
+            query = query.where(Knowledge.expert_id == expert_id)
+        
+        query = query.order_by(desc(Knowledge.created_at))
+        
+        result = await session.execute(query)
+        rows = result.all()
+        
+        # 转换为训练数据格式
+        training_data = []
+        for knowledge, expert_name, expert_subject in rows:
+            # 从content解析问题和答案
+            content = knowledge.content
+            question = ""
+            answer = content
+            
+            # 尝试解析标准格式 "问题：xxx
+            # 答案：xxx"
+            if "问题：" in content and "答案：" in content:
+                parts = content.split("答案：", 1)
+                question = parts[0].replace("问题：", "").strip()
+                answer = parts[1].strip()
+            elif "Q:" in content and "A:" in content:
+                parts = content.split("A:", 1)
+                question = parts[0].replace("Q:", "").strip()
+                answer = parts[1].strip()
+            
+            item = {
+                "id": knowledge.id,
+                "subject": expert_subject,
+                "question": question or "请回答以下问题",
+                "answer": answer,
+                "content": content,
+                "quality_score": knowledge.quality_score,
+                "usage_count": knowledge.usage_count,
+                "source_type": knowledge.source_type,
+                "created_at": knowledge.created_at.isoformat() if knowledge.created_at else None
+            }
+            training_data.append(item)
+        
+        # 统计信息
+        stats = {
+            "total_exported": len(training_data),
+            "format": format,
+            "expert_id": expert_id,
+            "min_quality": min_quality,
+            "subject_distribution": {}
+        }
+        
+        # 统计学科分布
+        for item in training_data:
+            subject = item["subject"]
+            stats["subject_distribution"][subject] = stats["subject_distribution"].get(subject, 0) + 1
+        
+        return ResponseBase(
+            message=f"成功导出 {len(training_data)} 条知识数据",
+            data={
+                "stats": stats,
+                "data": training_data,
+                "usage": "可用于LoRA微调训练数据，建议配合LLaMA-Factory等开源工具使用"
+            }
+        )
+    
+    except Exception as e:
+        return ResponseBase(code=500, message=f"导出失败: {str(e)}", data=None)

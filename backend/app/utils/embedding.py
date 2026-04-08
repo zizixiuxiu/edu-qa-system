@@ -108,6 +108,13 @@ class EmbeddingService:
 # 全局单例实例
 embedding_service = EmbeddingService()
 
+# 启动时预加载模型（避免首次请求时加载慢）
+def preload_embedding_model():
+    """预加载embedding模型"""
+    print("[EmbeddingService] 启动预加载模型...")
+    embedding_service._load_model()
+    print("[EmbeddingService] 预加载完成")
+
 
 def get_embedding(text: str) -> List[float]:
     """获取文本的embedding向量（便捷函数）"""

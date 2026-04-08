@@ -56,13 +56,19 @@ class Tier0IngestService:
             # 4. 生成去重哈希
             dedup_hash = hashlib.md5(question[:100].encode('utf-8')).hexdigest()
             
-            # 5. 创建 Tier0Knowledge 记录
+            # 5. 确保 embedding 是 list 类型
+            if hasattr(embedding, 'tolist'):
+                embedding_list = embedding.tolist()
+            else:
+                embedding_list = list(embedding)
+            
+            # 6. 创建 Tier0Knowledge 记录
             knowledge_type = quality_result.get("knowledge_type", "qa")
             
             knowledge = Tier0Knowledge(
                 expert_id=expert_id,
                 content=question[:500],
-                embedding=embedding.tolist(),
+                embedding=embedding_list,
                 meta_data={
                     "question": question,
                     "answer": cloud_corrected,
@@ -131,13 +137,23 @@ class Tier0IngestService:
             }
         
         from sqlalchemy import func
+        from pgvector.sqlalchemy import Vector
+        
+        # 确保 embedding 是 list 类型
+        if hasattr(new_embedding, 'tolist'):
+            embedding_list = new_embedding.tolist()
+        else:
+            embedding_list = list(new_embedding)
+        
+        # 将 list 转换为 pgvector 类型
+        embedding_vector = func.cast(embedding_list, Vector(384))
         
         # 第二层：向量相似度精确去重
         vector_stmt = select(
             Tier0Knowledge,
-            (1 - func.cosine_distance(Tier0Knowledge.embedding, new_embedding.tolist())).label("similarity")
+            (1 - func.cosine_distance(Tier0Knowledge.embedding, embedding_vector)).label("similarity")
         ).order_by(
-            Tier0Knowledge.embedding.op('<=>')(new_embedding.tolist())
+            Tier0Knowledge.embedding.op('<=>')(embedding_vector)
         ).limit(1)
         
         vector_result = await session.execute(vector_stmt)
@@ -145,7 +161,10 @@ class Tier0IngestService:
         
         if closest:
             knowledge, similarity = closest
-            similarity = float(similarity)
+            if similarity is None:
+                similarity = 0.0
+            else:
+                similarity = float(similarity)
             
             if similarity >= self.SIMILARITY_THRESHOLD:
                 if new_score > knowledge.quality_score:

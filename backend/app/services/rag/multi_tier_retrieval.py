@@ -235,7 +235,7 @@ class MultiTierRetriever:
         query: str,
         subject: Optional[str] = None,
         top_k: int = 5,
-        tier_weights: Tuple[float, float, float] = (0.5, 0.3, 0.2),  # Tier 0/1/2
+        tier_weights: Tuple[float, float, float] = (0.95, 1.0, 0.7),  # Tier 0/1/2
         score_threshold: float = 0.5
     ) -> List[RetrievalResult]:
         """三级检索 - Tier 0 > Tier 1 > Tier 2"""
@@ -372,7 +372,7 @@ class MultiTierRetriever:
         ).limit(top_k)
         
         result = await session.execute(stmt)
-        return [(row[0], float(row[1])) for row in result.all()]
+        return [(row[0], float(row[1])) for row in result.all() if row[1] is not None]
 
 
 # 全局单例
