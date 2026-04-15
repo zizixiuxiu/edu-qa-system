@@ -1,0 +1,92 @@
+# Dependencies
+frontend/node_modules/
+backend/venv/
+v2/frontend/node_modules/
+v2/backend/venv/
+v2/backend/venv/
+venv_temp/
+backend/__pycache__/
+backend/**/__pycache__/
+backend/.pytest_cache/
+
+# Build outputs
+frontend/dist/
+frontend/dist-ssr/
+*.local
+
+# Python cache
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Vector cache (large files)
+vector_cache/
+vector_cache_v2/
+D:/毕设数据集/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Backup files
+*.bak
+*.backup
+
+# Large model files
+*.bin
+*.safetensors
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.onnx
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Coverage
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+
+# System/Environment
+backend/.venv/
+backend/models/
+.env.gaokao
+
+# Generated data & reports
+backend/data/GAOKAO-Bench/
+backend/data/gaokao_full.json
+backend/data/gaokao_sample.json
+backend/app/benchmark_reports/reports/
+backend/app/benchmark_reports/comparisons/

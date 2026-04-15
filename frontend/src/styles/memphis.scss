@@ -1,0 +1,150 @@
+/* 孟菲斯设计风格 (Memphis Design) + 新粗野主义 (Neo-Brutalism) */
+
+:root {
+  /* 核心配色 */
+  --memphis-blue: #5C63A9;
+  --memphis-yellow: #FFF14F;
+  --memphis-pink: #FF78A5;
+  --memphis-teal: #4CC9BB;
+  --memphis-peach: #F28E70;
+  --memphis-black: #111111;
+  --memphis-white: #FFFFFF;
+  
+  /* 边框与阴影 */
+  --border-width: 3px;
+  --border: var(--border-width) solid var(--memphis-black);
+  --shadow-size: 6px;
+  --shadow: var(--shadow-size) var(--shadow-size) 0 0 var(--memphis-black);
+  --shadow-hover: 8px 8px 0 0 var(--memphis-black);
+  --shadow-active: 0px 0px 0 0 var(--memphis-black);
+  
+  /* 字体 */
+  --font-display: 'Space Grotesk', sans-serif;
+  --font-body: 'Inter', sans-serif;
+  --font-mono: 'DM Mono', monospace;
+  
+  /* 点状图案 */
+  --pattern-stipple: url("data:image/svg+xml,%3Csvg width='8' height='8' viewBox='0 0 8 8' xmlns='http://www.w3.org/2000/svg'%3E%3Ccircle cx='2' cy='2' r='1' fill='%23111'/%3E%3Ccircle cx='6' cy='6' r='1' fill='%23111'/%3E%3C/svg%3E");
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 0;
+  font-family: var(--font-body);
+  background-color: var(--memphis-blue);
+  color: var(--memphis-black);
+  min-height: 100vh;
+  background-image: 
+    url("data:image/svg+xml,%3Csvg width='100' height='100' viewBox='0 0 100 100' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M10 50 Q 25 20 50 50 T 90 50' fill='none' stroke='%234CC9BB' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E"),
+    url("data:image/svg+xml,%3Csvg width='150' height='150' viewBox='0 0 150 150' xmlns='http://www.w3.org/2000/svg'%3E%3Cpolygon points='75,20 120,100 30,100' fill='%23FF78A5' stroke='%23111' stroke-width='3'/%3E%3C/svg%3E"),
+    url("data:image/svg+xml,%3Csvg width='80' height='80' viewBox='0 0 80 80' xmlns='http://www.w3.org/2000/svg'%3E%3Ccircle cx='40' cy='40' r='15' fill='%23FFF14F' stroke='%23111' stroke-width='3'/%3E%3C/svg%3E");
+  background-position: 5% 10%, 85% 20%, 15% 85%;
+  background-repeat: no-repeat;
+  background-attachment: fixed;
+}
+
+::-webkit-scrollbar { width: 16px; }
+::-webkit-scrollbar-track { background: var(--memphis-white); border-left: var(--border); }
+::-webkit-scrollbar-thumb { background: var(--memphis-pink); border: var(--border); border-right: none; border-top: none; }
+::-webkit-scrollbar-thumb:hover { background: var(--memphis-teal); }
+
+/* Element Plus 覆盖 */
+.el-button {
+  font-family: var(--font-display);
+  font-weight: 700;
+  text-transform: uppercase;
+  border: var(--border) !important;
+  border-radius: 0 !important;
+  box-shadow: var(--shadow);
+  transition: all 0.1s ease;
+  
+  &:hover { box-shadow: var(--shadow-hover); transform: translate(-2px, -2px); }
+  &:active { box-shadow: var(--shadow-active); transform: translate(var(--shadow-size), var(--shadow-size)); }
+  
+  &--primary { background-color: var(--memphis-teal) !important; border-color: var(--memphis-black) !important; color: var(--memphis-black) !important; }
+  &--success { background-color: var(--memphis-yellow) !important; border-color: var(--memphis-black) !important; color: var(--memphis-black) !important; }
+  &--warning { background-color: var(--memphis-peach) !important; border-color: var(--memphis-black) !important; color: var(--memphis-black) !important; }
+  &--danger { background-color: var(--memphis-pink) !important; border-color: var(--memphis-black) !important; color: var(--memphis-black) !important; }
+}
+
+.el-card {
+  border: var(--border) !important;
+  border-radius: 0 !important;
+  box-shadow: var(--shadow) !important;
+  .el-card__header {
+    background: var(--memphis-white);
+    border-bottom: var(--border);
+    font-family: var(--font-display);
+    font-weight: 700;
+    text-transform: uppercase;
+  }
+}
+
+.el-input__wrapper {
+  border: var(--border) !important;
+  border-radius: 0 !important;
+  box-shadow: var(--shadow) !important;
+  &:focus-within { box-shadow: var(--shadow-hover) !important; }
+}
+
+.el-menu {
+  border-right: var(--border) !important;
+  background: var(--memphis-white) !important;
+  .el-menu-item {
+    font-family: var(--font-display);
+    font-weight: 600;
+    border-bottom: 2px solid transparent;
+    &:hover, &.is-active { background: var(--memphis-yellow) !important; border-bottom-color: var(--memphis-black); }
+  }
+}
+
+.el-tag {
+  font-family: var(--font-display);
+  font-weight: 700;
+  border: 2px solid var(--memphis-black) !important;
+  border-radius: 0 !important;
+  &--success { background: var(--memphis-teal) !important; }
+  &--warning { background: var(--memphis-yellow) !important; }
+  &--danger { background: var(--memphis-pink) !important; }
+}
+
+.el-table {
+  border: var(--border) !important;
+  th { background: var(--memphis-black) !important; color: var(--memphis-white) !important; font-family: var(--font-display); text-transform: uppercase; }
+  td { border-bottom: 2px solid #eee !important; }
+  tr:hover > td { background: var(--memphis-yellow) !important; }
+}
+
+.el-dialog {
+  border: var(--border) !important;
+  border-radius: 0 !important;
+  box-shadow: 12px 12px 0 0 var(--memphis-black) !important;
+  .el-dialog__header {
+    background: var(--memphis-black);
+    margin-right: 0;
+    padding: 16px 20px;
+    .el-dialog__title { color: var(--memphis-white); font-family: var(--font-display); font-weight: 700; text-transform: uppercase; }
+  }
+}
+
+.el-message {
+  border: var(--border) !important;
+  border-radius: 0 !important;
+  box-shadow: var(--shadow) !important;
+  font-family: var(--font-display);
+  font-weight: 600;
+  &--success { background: var(--memphis-teal) !important; }
+  &--warning { background: var(--memphis-yellow) !important; }
+  &--error { background: var(--memphis-pink) !important; }
+}
+
+/* 自定义工具类 */
+.memphis-title { font-family: var(--font-display); font-weight: 700; text-transform: uppercase; letter-spacing: -0.5px; }
+.memphis-box { background: var(--memphis-white); border: var(--border); box-shadow: var(--shadow); }
+.memphis-box-yellow { background: var(--memphis-yellow); }
+.memphis-box-pink { background: var(--memphis-pink); }
+.memphis-box-teal { background: var(--memphis-teal); }
+.memphis-box-peach { background: var(--memphis-peach); }
+.stipple-pattern { background-image: var(--pattern-stipple); }
