@@ -190,22 +190,25 @@ class DataGenerator:
             else:
                 embedding = embedding_service.encode(retrieval_context)
             
-            # 存储知识 - content存完整高质量回答，保证质量优先
+            # 存储知识 - 使用 question/answer 主字段，content存检索内容
             knowledge = Knowledge(
                 expert_id=expert_id,
-                content=corrected_answer,  # 完整高质量答案（不精简，保证质量）
+                question=question,  # 问题字段（必填）
+                answer=corrected_answer,  # 答案字段（必填）
+                content=retrieval_context,  # 检索内容（用于embedding匹配）
                 embedding=embedding,
                 knowledge_type=knowledge_type,
                 source_type="generated",
                 quality_score=quality_score,
+                tier=1 if quality_score >= 4.5 else 2,  # 高质量知识设为 tier 1
                 meta_data={
                     "question": question,
-                    "answer": corrected_answer,  # 完整答案
+                    "answer": corrected_answer,
                     "knowledge_type": knowledge_type,
                     "subject": subject,
                     "source_session_id": session_id,
                     "quality_score": quality_score,
-                    "retrieval_context": retrieval_context,  # 检索上下文
+                    "retrieval_context": retrieval_context,
                 }
             )
             session.add(knowledge)

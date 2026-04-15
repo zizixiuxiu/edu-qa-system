@@ -345,32 +345,62 @@ async def get_subjects():
 
 @router.get("/dashboard")
 async def get_dashboard(session: AsyncSession = Depends(get_session)):
-    """获取实验仪表盘数据（包含知识库统计）"""
+    """获取实验仪表盘数据（首页概览）"""
     from sqlalchemy import select, func
-    from app.models.database import Knowledge
+    from datetime import datetime, timedelta
+    from app.models.database import Expert, Knowledge, Tier0Knowledge, Session, SFTData
     
-    # 统计知识库数量
-    knowledge_count_result = await session.execute(select(func.count(Knowledge.id)))
-    total_knowledge = knowledge_count_result.scalar() or 0
+    # 统计专家数量
+    experts_result = await session.execute(select(func.count(Expert.id)))
+    total_experts = experts_result.scalar() or 0
     
-    # 统计高质量知识（≥4.0分）
-    high_quality_result = await session.execute(
-        select(func.count(Knowledge.id)).where(Knowledge.quality_score >= 4.0)
+    # 统计知识条目 (Knowledge + Tier0Knowledge)
+    knowledge_result = await session.execute(select(func.count(Knowledge.id)))
+    total_knowledge = knowledge_result.scalar() or 0
+    tier0_result = await session.execute(select(func.count(Tier0Knowledge.id)))
+    total_tier0 = tier0_result.scalar() or 0
+    total_knowledge_entries = total_knowledge + total_tier0
+    
+    # 统计问答总数
+    sessions_result = await session.execute(select(func.count(Session.id)))
+    total_sessions = sessions_result.scalar() or 0
+    
+    # 统计微调数据
+    sft_result = await session.execute(select(func.count(SFTData.id)))
+    total_sft_data = sft_result.scalar() or 0
+    
+    # 今日数据
+    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    today_sessions_result = await session.execute(
+        select(func.count(Session.id)).where(Session.created_at >= today_start)
     )
-    high_quality_knowledge = high_quality_result.scalar() or 0
+    today_sessions = today_sessions_result.scalar() or 0
+    
+    # 今日平均响应时间
+    today_avg_time_result = await session.execute(
+        select(func.avg(Session.response_time)).where(Session.created_at >= today_start)
+    )
+    today_avg_response_time = today_avg_time_result.scalar() or 0
+    
+    # 今日准确率 (有评分的数据)
+    today_accuracy_result = await session.execute(
+        select(func.avg(Session.overall_score))
+        .where(Session.created_at >= today_start)
+        .where(Session.overall_score.isnot(None))
+    )
+    today_accuracy = today_accuracy_result.scalar()
+    today_accuracy = round(today_accuracy * 20, 1) if today_accuracy else 0  # 转换为百分比 (5分制->100分制)
     
     return {
         "code": 200,
         "data": {
-            "total_experiments": len(_experiment_queue),
-            "completed": len([e for e in _experiment_queue if e.status == "completed"]),
-            "running": len([e for e in _experiment_queue if e.status == "running"]),
-            "pending": len([e for e in _experiment_queue if e.status == "pending"]),
-            "knowledge_stats": {
-                "total": total_knowledge,
-                "high_quality": high_quality_knowledge,
-                "ready_for_phase2": high_quality_knowledge >= 20  # 建议至少20条高质量知识
-            }
+            "total_experts": total_experts,
+            "total_knowledge": total_knowledge_entries,
+            "total_sessions": total_sessions,
+            "total_sft_data": total_sft_data,
+            "today_sessions": today_sessions,
+            "today_avg_response_time": round(today_avg_response_time, 0),
+            "today_accuracy": today_accuracy
         }
     }
 

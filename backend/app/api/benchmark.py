@@ -195,7 +195,11 @@ current_test_task = {
 }
 
 # GAOKAO-Bench 数据集本地路径
-GAOKAO_BENCH_PATH = os.environ.get("GAOKAO_BENCH_PATH", "D:\\kimi_code\\GAOKAO-Bench-main")
+# 优先从环境变量读取，否则使用默认路径
+GAOKAO_BENCH_PATH = os.environ.get(
+    "GAOKAO_BENCH_PATH", 
+    "/Users/zizixiuixu/Downloads/GAOKAO-Bench-main"
+)
 
 # 学科映射
 SUBJECT_MAPPING = {
@@ -785,7 +789,15 @@ async def get_benchmark_report(
     results = result.scalars().all()
     
     if not results:
-        return {"message": "暂无测试数据"}
+        return {
+            "summary": {"total_questions": 0, "correct_count": 0, "wrong_count": 0, "accuracy_rate": 0, "avg_score": 0},
+            "all_results": [],
+            "by_subject": {},
+            "by_year": {},
+            "wrong_questions": [],
+            "low_score_questions": [],
+            "message": "暂无测试数据"
+        }
     
     # 按学科统计
     subject_stats = {}
@@ -924,34 +936,52 @@ async def export_benchmark_report(
     session: AsyncSession = Depends(get_async_session)
 ):
     """导出基准测试报告"""
-    report = await get_benchmark_report(expert_id, session)
-    
-    if format == "json":
-        return report
-    elif format == "csv":
-        # 生成CSV格式
-        import io
-        import csv
+    try:
+        report = await get_benchmark_report(expert_id=expert_id, session=session)
         
-        output = io.StringIO()
-        writer = csv.writer(output)
+        # 检查是否有数据
+        if not report or "summary" not in report:
+            if format == "json":
+                return {"message": "暂无测试数据", "data": []}
+            else:
+                return {"csv_content": "暂无测试数据\n"}
         
-        # 写入表头
-        writer.writerow(["题目ID", "学科", "年份", "是否正确", "总分", "准确性", "完整性", "教育价值", "正确答案", "模型回答"])
-        
-        # 写入数据
-        for r in report.get("all_results", []):
-            writer.writerow([
-                r["id"], r["subject"], r["year"], 
-                "是" if r["is_correct"] else "否",
-                r["overall_score"], r["accuracy_score"],
-                r["completeness_score"], r["educational_score"],
-                r["correct_answer"], r["model_answer"]
-            ])
-        
-        return {"csv_content": output.getvalue()}
-    else:
-        raise HTTPException(status_code=400, detail="不支持的格式")
+        if format == "json":
+            return report
+        elif format == "csv":
+            # 生成CSV格式
+            import io
+            import csv
+            
+            output = io.StringIO()
+            writer = csv.writer(output)
+            
+            # 写入表头
+            writer.writerow(["题目ID", "学科", "年份", "是否正确", "总分", "准确性", "完整性", "教育价值", "正确答案", "模型回答"])
+            
+            # 写入数据
+            for r in report.get("all_results", []):
+                writer.writerow([
+                    r.get("id", ""), 
+                    r.get("subject", ""), 
+                    r.get("year", ""), 
+                    "是" if r.get("is_correct") else "否",
+                    r.get("overall_score", 0), 
+                    r.get("accuracy_score", 0),
+                    r.get("completeness_score", 0), 
+                    r.get("educational_score", 0),
+                    r.get("correct_answer", ""), 
+                    r.get("model_answer", "")
+                ])
+            
+            return {"csv_content": output.getvalue()}
+        else:
+            raise HTTPException(status_code=400, detail="不支持的格式")
+    except Exception as e:
+        import traceback
+        print(f"导出报告失败: {e}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"导出失败: {str(e)}")
 
 
 @router.post("/add-to-iteration")
@@ -1371,10 +1401,15 @@ async def _import_from_local(session: AsyncSession, base_path: str, specific_sub
                 data = json.load(f)
             
             for item in data.get('example', []):
+                # 获取题目内容，确保不为 None
+                question = item.get("question") or ""
+                if not question.strip():
+                    continue
+                
                 # 检查是否已存在
                 existing = await session.execute(
                     select(BenchmarkDataset).where(
-                        BenchmarkDataset.question == item.get("question", "")
+                        BenchmarkDataset.question == question
                     )
                 )
                 if existing.scalar_one_or_none():
@@ -1387,19 +1422,23 @@ async def _import_from_local(session: AsyncSession, base_path: str, specific_sub
                     seen = set()
                     unique_answers = []
                     for a in answer:
-                        if a not in seen:
+                        if a and a not in seen:
                             seen.add(a)
                             unique_answers.append(a)
                     answer = ", ".join(unique_answers)
+                elif answer is None:
+                    answer = ""
+                else:
+                    answer = str(answer)
                 
                 dataset = BenchmarkDataset(
-                    question=item.get("question", ""),
+                    question=question,
                     correct_answer=answer,
                     subject=subject_cn,
-                    year=item.get("year"),
-                    category=item.get("category"),
-                    score=item.get("score"),
-                    analysis=item.get("analysis"),
+                    year=item.get("year") or "",
+                    category=item.get("category") or "",
+                    score=item.get("score") or 0,
+                    analysis=item.get("analysis") or "",
                     question_type="objective",
                     source_url=f"file://{filepath}"
                 )

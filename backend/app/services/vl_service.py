@@ -98,7 +98,7 @@ class VLService:
         messages = [{"role": "system", "content": system_prompt}]
         
         # 构建用户消息（处理纯图片情况）
-        user_text = query if query.strip() else "请判断图片内容所属学科"
+        user_text = query if (query and query.strip()) else "请判断图片内容所属学科"
         user_content = user_text
         has_image = image_base64 is not None and len(image_base64) > 100
         if has_image:
@@ -114,7 +114,8 @@ class VLService:
             ]
             print(f"[VL调试] 包含图片，URL长度: {len(image_url)}")
         else:
-            print(f"[VL调试] 无图片，纯文本查询: {query[:50]}")
+            query_display = query[:50] if query else "[空]"
+            print(f"[VL调试] 无图片，纯文本查询: {query_display}")
         
         messages.append({"role": "user", "content": user_content})
         
@@ -168,12 +169,14 @@ class VLService:
         except httpx.ConnectError as e:
             print(f"[VL识别失败] 无法连接LMStudio ({self.base_url}): {e}")
             fallback_result = self._fallback_identify(query)
-            print(f"[VL降级识别] '{query[:50]}...' -> {fallback_result['subject']}")
+            query_display = query[:50] if query else "[空]"
+            print(f"[VL降级识别] '{query_display}...' -> {fallback_result['subject']}")
             return fallback_result
         except Exception as e:
             print(f"[VL识别失败] 其他错误: {e}")
             fallback_result = self._fallback_identify(query)
-            print(f"[VL降级识别] '{query[:50]}...' -> {fallback_result['subject']}")
+            query_display = query[:50] if query else "[空]"
+            print(f"[VL降级识别] '{query_display}...' -> {fallback_result['subject']}")
             return fallback_result
     
     def _parse_subject_response(self, content: str) -> Dict[str, str]:
@@ -231,6 +234,8 @@ class VLService:
         处理别名和近似名称
         保证返回的学科一定在SUPPORTED_SUBJECTS中
         """
+        if not subject:
+            return "通用"
         subject = subject.strip()
         
         # 直接匹配
@@ -265,6 +270,8 @@ class VLService:
     
     def _simulate_identify(self, query: str) -> Dict[str, str]:
         """模拟学科识别 - 增强版关键词匹配（降级策略）"""
+        if not query:
+            return {"subject": "通用", "confidence": "low"}
         query_lower = query.lower()
         
         # 优先级排序的关键词（越具体的越优先）

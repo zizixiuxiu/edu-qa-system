@@ -361,6 +361,8 @@ class RetrievalService:
         # 按内容去重
         seen_content = {}
         for result in results:
+            if not result.knowledge.content:
+                continue
             content = result.knowledge.content.strip()
             if content not in seen_content or seen_content[content].combined_score < result.combined_score:
                 seen_content[content] = result

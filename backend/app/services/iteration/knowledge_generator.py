@@ -189,7 +189,8 @@ class KnowledgeGenerator:
                 )
                 response.raise_for_status()
                 result = response.json()
-                content = result["choices"][0]["message"]["content"].strip()
+                content = result["choices"][0]["message"].get("content", "") or ""
+                content = content.strip()
                 
                 # 清理输出
                 content = content.replace("- ", "").replace("【", "").replace("】", "").strip()
@@ -255,7 +256,8 @@ class KnowledgeGenerator:
                 )
                 response.raise_for_status()
                 result = response.json()
-                output = result["choices"][0]["message"]["content"].strip()
+                output = result["choices"][0]["message"].get("content", "") or ""
+                output = output.strip()
                 return output
                 
         except Exception as e:

@@ -47,6 +47,8 @@ class ExpertPoolManager:
             Expert: 学科专家对象
         """
         # 标准化学科名称
+        if not subject:
+            return None
         subject = subject.strip()
         cache_key = ("expert", subject)
         
@@ -129,6 +131,8 @@ class ExpertPoolManager:
     ) -> Optional[Expert]:
         """通过学科名称获取专家 - 带缓存"""
         # 复用get_or_create_expert逻辑，但不创建
+        if not subject:
+            return None
         subject = subject.strip()
         
         # L1

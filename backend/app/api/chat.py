@@ -54,7 +54,7 @@ async def send_message(
     
     try:
         # 处理纯图片情况：如果 query 为空，使用默认提示
-        user_query = request.query if request.query.strip() else "请解答图片中的题目"
+        user_query = request.query if (request.query and request.query.strip()) else "请解答图片中的题目"
         
         # 获取当前实验配置
         exp_config = get_current_experiment_config()

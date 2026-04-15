@@ -129,7 +129,7 @@ class LLMService:
         messages = [{"role": "system", "content": system_prompt}]
         
         # 确保 query 不为空
-        user_text = query if query.strip() else "请解答图片中的题目"
+        user_text = query if (query and query.strip()) else "请解答图片中的题目"
         
         # 🔥 修复：使用多模态格式兼容 VL 模型
         # qwen3-vl 需要 content 为数组格式，即使是纯文本

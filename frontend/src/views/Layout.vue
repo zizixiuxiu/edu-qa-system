@@ -57,7 +57,8 @@ const appStore = useAppStore()
 
 const menuRoutes = computed(() => {
   return router.getRoutes()
-    .find(r => r.name === 'Layout')?.children || []
+    .find(r => r.name === 'Layout')?.children
+    ?.filter(r => !r.meta?.hidden) || []
 })
 </script>
 

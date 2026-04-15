@@ -78,3 +78,15 @@ htmlcov/
 .coverage.*
 coverage.xml
 *.cover
+
+# System/Environment
+backend/.venv/
+backend/models/
+.env.gaokao
+
+# Generated data & reports
+backend/data/GAOKAO-Bench/
+backend/data/gaokao_full.json
+backend/data/gaokao_sample.json
+backend/app/benchmark_reports/reports/
+backend/app/benchmark_reports/comparisons/

@@ -332,12 +332,12 @@ async def export_knowledge(
             # 答案：xxx"
             if "问题：" in content and "答案：" in content:
                 parts = content.split("答案：", 1)
-                question = parts[0].replace("问题：", "").strip()
-                answer = parts[1].strip()
+                question = parts[0].replace("问题：", "").strip() if parts else ""
+                answer = parts[1].strip() if len(parts) > 1 and parts[1] else ""
             elif "Q:" in content and "A:" in content:
                 parts = content.split("A:", 1)
-                question = parts[0].replace("Q:", "").strip()
-                answer = parts[1].strip()
+                question = parts[0].replace("Q:", "").strip() if parts else ""
+                answer = parts[1].strip() if len(parts) > 1 and parts[1] else ""
             
             item = {
                 "id": knowledge.id,

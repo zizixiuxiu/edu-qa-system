@@ -34,7 +34,7 @@ const routes = [
         path: 'analytics',
         name: 'Analytics',
         component: () => import('../views/Analytics.vue'),
-        meta: { title: '数据分析', icon: 'TrendCharts' }
+        meta: { title: '数据分析', icon: 'TrendCharts', hidden: true }
       },
       {
         path: 'experiments',
